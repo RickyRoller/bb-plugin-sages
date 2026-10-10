@@ -1,0 +1,927 @@
+// bb-plugin-sages — backend entry.
+//
+// A sage is a tuned chat bound to a topic or project. Its chat never ends:
+// every message is logged in the plugin's database and compressed into a tree
+// of summaries (optchat.ts), and each user message runs as one turn in a
+// fresh, hidden bb thread whose first input is the view of that tree. This
+// file owns the sage records, the turns, the logging of what a turn's thread
+// does, the zoom/date tools, the compaction model call, and the CLI.
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { promisify } from "node:util";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
+import { COMPACTION_PROMPT, HANDOFF_PROMPT, TURN_PROMPT } from "./prompts";
+
+const sageSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  /** One line on what the sage is for; shown in lists. */
+  topic: z.string(),
+  /** Standing instructions given to the sage's agent. */
+  instructions: z.string(),
+  /** The project the sage's turns start in by default, if one is assigned. */
+  projectId: z.string().nullable().default(null),
+  /** The thread of the sage's latest turn. */
+  threadId: z.string().nullable().default(null),
+  /** Whether that turn is still going. */
+  running: z.boolean().default(false),
+  /** The id of the user message that turn started with. */
+  turnStart: z.number().nullable().default(null),
+  /** Why the latest turn failed, if it did. */
+  error: z.string().nullable().default(null),
+  /** The latest turn's selections, to seed the next composer. */
+  defaults: z.record(z.string(), z.unknown()).nullable().default(null),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Sage = z.infer<typeof sageSchema>;
+
+const statsSchema = z.object({
+  messages: z.number(),
+  viewBytes: z.number(),
+  pending: z.number(),
+});
+const listedSageSchema = sageSchema.extend({ stats: statsSchema });
+export type ListedSage = z.infer<typeof listedSageSchema>;
+
+const nameInput = z.string().trim().min(1).max(80);
+const topicInput = z.string().trim().max(200);
+// bb truncates dynamic thread instructions at 4096 characters; the cap leaves
+// room for the name and topic lines that are sent with them.
+const instructionsInput = z.string().trim().max(3500);
+
+// The composer's NewThreadRequest. bb validates it in full at spawn; this
+// checks only what the plugin reads.
+const promptPartSchema = z.looseObject({ type: z.string() });
+const turnRequestSchema = z.looseObject({
+  projectId: z.string(),
+  input: z.array(promptPartSchema).min(1),
+});
+
+export const rpcContract = defineRpcContract({
+  sages_list: {
+    input: z.null(),
+    output: z.object({ sages: z.array(listedSageSchema) }),
+  },
+  sages_create: {
+    input: z.object({
+      name: nameInput,
+      topic: topicInput.default(""),
+      instructions: instructionsInput.default(""),
+      projectId: z.string().nullable().default(null),
+    }),
+    output: sageSchema,
+  },
+  sages_update: {
+    input: z.object({
+      id: z.string(),
+      name: nameInput.optional(),
+      topic: topicInput.optional(),
+      instructions: instructionsInput.optional(),
+      projectId: z.string().nullable().optional(),
+    }),
+    output: sageSchema,
+  },
+  /** Deletes the sage and its whole chat. */
+  sages_remove: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ removed: z.boolean() }),
+  },
+  /** Starts a turn: one user message, answered in a fresh thread. */
+  sages_send: {
+    input: z.object({ id: z.string(), request: turnRequestSchema }),
+    output: sageSchema,
+  },
+  /** The user's and the sage's messages before `before`, oldest first. */
+  sages_history: {
+    input: z.object({
+      id: z.string(),
+      before: z.number().int().nullable(),
+      limit: z.number().int().min(1).max(200),
+    }),
+    output: z.object({
+      messages: z.array(
+        z.object({
+          i: z.number(),
+          kind: z.enum(["user", "sage", "tool", "echo", "work"]),
+          text: z.string(),
+          date: z.string(),
+        }),
+      ),
+    }),
+  },
+});
+
+/** Realtime channel app.tsx listens on. */
+const SAGES_CHANGED = "sages-changed";
+const ZOOM_TOOL = "sage_zoom";
+const DATE_TOOL = "sage_date";
+const HANDOFF_TOOL = "sage_handoff";
+
+/** A specialist, as the Specialists plugin lists it. */
+const specialistSchema = z.looseObject({
+  name: z.string(),
+  description: z.string(),
+  providerId: z.string().nullable(),
+  model: z.string().nullable(),
+  reasoningLevel: z.string().nullable(),
+});
+type Specialist = z.infer<typeof specialistSchema>;
+
+function specialistsText(specialists: Specialist[] | null): string {
+  if (specialists === null) {
+    return "Specialists: unavailable right now (the Specialists plugin did not answer).";
+  }
+  if (specialists.length === 0) return "Specialists: none are set up.";
+  return [
+    "Specialists you can hand work to with sage_handoff:",
+    ...specialists.map((each) => {
+      const model =
+        each.model === null
+          ? "project default model"
+          : `${each.providerId === null ? "" : `${each.providerId}/`}${each.model}${each.reasoningLevel === null ? "" : ` (${each.reasoningLevel})`}`;
+      return `- ${each.name} [${model}]: ${each.description || "no description"}`;
+    }),
+  ].join("\n");
+}
+/** bb's cap on one page of thread events. */
+const EVENT_PAGE = 100;
+/** The thread events a turn is logged from. */
+const LOGGED_EVENTS = [
+  "client/turn/requested",
+  "item/completed",
+  "turn/started",
+  "turn/completed",
+] as const;
+
+function sageInstructions(sage: Sage): string {
+  return [
+    `# Your sage instructions`,
+    `Your name is "${sage.name}".`,
+    sage.topic === "" ? null : `Your subject: ${sage.topic}`,
+    sage.instructions === "" ? null : `\n${sage.instructions}`,
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+/** A prompt input as the chat logs it: the words, and a mark per attachment. */
+function inputText(input: unknown): string {
+  if (!Array.isArray(input)) return "";
+  return input
+    .map((part: Record<string, unknown>) => {
+      if (part.visibility === "agent-only") return null;
+      if (part.type === "text") return String(part.text ?? "");
+      return `[${String(part.type)}${typeof part.path === "string" ? `: ${part.path}` : ""}]`;
+    })
+    .filter((text) => text !== null && text !== "")
+    .join("\n");
+}
+
+/** A completed timeline item as a tool call and its result. */
+function toolTexts(item: Record<string, unknown>): {
+  tool: string;
+  echo: string | null;
+} {
+  const {
+    type,
+    tool,
+    id: _id,
+    status: _status,
+    presentation: _presentation,
+    approvalStatus: _approvalStatus,
+    result,
+    aggregatedOutput,
+    output,
+    ...input
+  } = item;
+  const out = result ?? aggregatedOutput ?? output ?? null;
+  return {
+    tool: `${String(type === "toolCall" ? tool : type)} ${JSON.stringify(input.arguments ?? input)}`,
+    echo:
+      out === null ? null : typeof out === "string" ? out : JSON.stringify(out),
+  };
+}
+
+const errorText = (cause: unknown) =>
+  cause instanceof Error ? cause.message : String(cause);
+
+export default async function plugin(bb: BbPluginApi) {
+  const settings = bb.settings.define({
+    compactionModel: {
+      type: "string",
+      label: "Compaction model",
+      description:
+        "The cheap model that summarizes the chat in the background, as a Claude Code model name.",
+      default: "haiku",
+    },
+    compactionEffort: {
+      type: "select",
+      label: "Compaction effort",
+      options: ["low", "medium", "high", "xhigh", "max"],
+      default: "xhigh",
+    },
+    claudePath: {
+      type: "string",
+      label: "Claude Code command",
+      description:
+        "The claude CLI that runs compactions. Leave as is to find it on your shell's PATH.",
+      default: "claude",
+    },
+  });
+
+  const db = bb.storage.database();
+  bb.storage.migrate(db, MIGRATIONS);
+
+  // bb.agents.configure is synchronous, so sages are served from memory and
+  // written through to storage.
+  let sages = z
+    .array(sageSchema)
+    .catch([])
+    .parse(await bb.storage.kv.get("sages"));
+
+  // Compactions land in bursts; one refetch signal per burst is enough.
+  let publishTimer: NodeJS.Timeout | null = null;
+  function publish(): void {
+    publishTimer ??= setTimeout(() => {
+      publishTimer = null;
+      bb.realtime.publish(SAGES_CHANGED, { count: sages.length });
+    }, 300);
+  }
+  async function writeSages(next: Sage[]): Promise<void> {
+    await bb.storage.kv.set("sages", next);
+    sages = next;
+    publish();
+  }
+  function findSage(id: string): Sage {
+    const sage = sages.find((candidate) => candidate.id === id);
+    if (sage === undefined) throw new Error(`No sage with id ${id}`);
+    return sage;
+  }
+  async function updateSage(id: string, patch: Partial<Sage>): Promise<Sage> {
+    const defined = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    );
+    const sage: Sage = {
+      ...findSage(id),
+      ...defined,
+      updatedAt: new Date().toISOString(),
+    };
+    await writeSages(
+      sages.map((candidate) => (candidate.id === id ? sage : candidate)),
+    );
+    return sage;
+  }
+  async function createSage(
+    fields: Pick<Sage, "name" | "topic" | "instructions" | "projectId">,
+  ): Promise<Sage> {
+    const now = new Date().toISOString();
+    const sage = sageSchema.parse({
+      id: randomUUID().slice(0, 8),
+      ...fields,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await writeSages([...sages, sage]);
+    return sage;
+  }
+
+  // --- Compaction calls: the claude CLI, headless, with no tools. ---
+
+  let claude: Promise<string> | null = null;
+  /** The claude binary: the setting as given, or looked up in the user's shell. */
+  function findClaude(command: string): Promise<string> {
+    claude ??= promisify(execFile)(command, ["--version"]).then(
+      () => command,
+      async () => {
+        const { stdout } = await promisify(execFile)(
+          process.env.SHELL ?? "/bin/sh",
+          ["-ilc", `command -v ${JSON.stringify(command)}`],
+        );
+        const found = stdout.trim().split("\n").pop() ?? "";
+        if (found === "") throw new Error(`"${command}" was not found`);
+        return found;
+      },
+    );
+    claude.catch(() => {
+      claude = null;
+    });
+    return claude;
+  }
+  const summarize: Summarize = async (conversation, signal) => {
+    const { compactionModel, compactionEffort, claudePath } =
+      await settings.get();
+    const command = await findClaude(claudePath);
+    // A retry is the same conversation, resent whole in one prompt.
+    const prompt = conversation
+      .map((message, index) =>
+        index % 2 === 0 ? message : `Your line was:\n${message}`,
+      )
+      .join("\n\n");
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        command,
+        [
+          "-p",
+          ...["--model", compactionModel],
+          ...["--effort", compactionEffort],
+          ...["--system-prompt", COMPACTION_PROMPT],
+          ...["--tools", ""],
+          ...["--setting-sources", ""],
+          "--strict-mcp-config",
+          "--disable-slash-commands",
+          "--no-session-persistence",
+        ],
+        {
+          cwd: tmpdir(),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(180_000)]),
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.stderr.on("data", (chunk) => (stderr += chunk));
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) resolve(stdout);
+        else {
+          reject(
+            new Error(
+              `claude exited with ${code}: ${(stderr || stdout).trim().slice(0, 300)}`,
+            ),
+          );
+        }
+      });
+      child.stdin.on("error", () => {});
+      child.stdin.end(prompt);
+    });
+  };
+
+  // --- Chats ---
+
+  const chats = new Map<string, Chat>();
+  function chatOf(sageId: string): Chat {
+    let chat = chats.get(sageId);
+    if (chat === undefined) {
+      chat = new Chat(db, sageId, summarize, (error) => {
+        if (error !== undefined) {
+          bb.log.warn(`compaction failed: ${errorText(error)}`);
+        }
+        publish();
+      });
+      chats.set(sageId, chat);
+    }
+    return chat;
+  }
+  /** Deletes the sage and its chat; its turn threads stay in bb, archived. */
+  async function removeSage(id: string): Promise<boolean> {
+    if (!sages.some((sage) => sage.id === id)) return false;
+    const { threadId } = findSage(id);
+    if (threadId !== null) bb.sdk.threads.archive({ threadId }).catch(() => {});
+    chatOf(id).destroy();
+    chats.delete(id);
+    await bb.storage.kv.delete(`cursor:${id}`);
+    await writeSages(sages.filter((sage) => sage.id !== id));
+    return true;
+  }
+
+  // One writer per chat: a sage's sends and its thread's events are handled
+  // one at a time, in order.
+  const queues = new Map<string, Promise<unknown>>();
+  function serial<T>(sageId: string, work: () => Promise<T>): Promise<T> {
+    const next = (queues.get(sageId) ?? Promise.resolve()).then(work, work);
+    queues.set(
+      sageId,
+      next.catch(() => {}),
+    );
+    return next;
+  }
+
+  // --- Turns ---
+
+  interface Cursor {
+    threadId: string;
+    /** The last event of the thread that was logged. */
+    seq: number;
+  }
+
+  /** Logs what the sage's thread did since the last call. */
+  async function drain(sageId: string): Promise<void> {
+    const sage = findSage(sageId);
+    const cursor = await bb.storage.kv.get<Cursor>(`cursor:${sageId}`);
+    if (cursor == null || cursor.threadId !== sage.threadId) return;
+    const chat = chatOf(sageId);
+    let running = sage.running;
+    for (;;) {
+      const events = await bb.sdk.threads.events.list({
+        threadId: cursor.threadId,
+        afterSeq: String(cursor.seq),
+        limit: String(EVENT_PAGE),
+        types: [...LOGGED_EVENTS],
+      });
+      for (const event of events) {
+        const date = new Date(event.createdAt).toISOString();
+        const data = event.data as Record<string, unknown>;
+        const item = (data.item ?? {}) as Record<string, unknown>;
+        if (event.type === "turn/started") running = true;
+        else if (event.type === "turn/completed") running = false;
+        else if (event.type === "client/turn/requested") {
+          // The spawn's own message is logged by send(); these are the
+          // messages the user sends while the sage works.
+          if (data.source !== "spawn") {
+            const text = inputText(data.input);
+            chat.append(reports.delete(text) ? "work" : "user", text, date);
+          }
+        } else if (item.type === "agentMessage") {
+          chat.append("sage", String(item.text ?? ""), date);
+        } else if (item.type !== "reasoning") {
+          // Thoughts are shown but never logged.
+          const { tool, echo } = toolTexts(item);
+          chat.append("tool", tool, date);
+          if (echo !== null) chat.append("echo", echo, date);
+        }
+        cursor.seq = event.seq;
+      }
+      if (events.length < EVENT_PAGE) break;
+    }
+    await bb.storage.kv.set(`cursor:${sageId}`, cursor);
+    if (running !== sage.running) await updateSage(sageId, { running });
+  }
+
+  async function send(
+    sageId: string,
+    request: z.infer<typeof turnRequestSchema>,
+    kind: Kind = "user",
+  ): Promise<Sage> {
+    let sage = findSage(sageId);
+    if (sage.running && sage.threadId !== null) {
+      // The flag follows the thread's events; ask the thread before refusing.
+      await drain(sageId);
+      const thread = await bb.sdk.threads.get({ threadId: sage.threadId });
+      if (thread.status === "idle" || thread.status === "error") {
+        await updateSage(sageId, { running: false });
+      }
+      sage = findSage(sageId);
+      if (sage.running) {
+        throw new Error(`${sage.name} is still working on the last message`);
+      }
+    }
+    const chat = chatOf(sageId);
+    // Every message before this one is summarized first, so the view holds
+    // no placeholder for work the compactor is about to finish.
+    await chat.settled();
+    // The view is rendered before the new message is logged: the message
+    // goes whole after it. Per-turn state follows the view, so the view
+    // stays a stable prefix from one turn to the next.
+    const view = chat.render();
+    // Read now, so every turn sees the specialists as they are.
+    const specialists = await listSpecialists();
+    const thread = await bb.sdk.threads.spawn({
+      ...(request as Record<string, unknown>),
+      projectId: request.projectId,
+      input: [
+        { type: "text", text: view, visibility: "agent-only", mentions: [] },
+        {
+          type: "text",
+          text: `Date: ${new Date().toString()}\n\n${specialistsText(specialists)}`,
+          visibility: "agent-only",
+          mentions: [],
+        },
+        ...request.input,
+      ],
+      title: sage.name,
+      // Sages always run with full access, whatever the composer sent.
+      permissionMode: "full",
+      // A turn's thread is plumbing: the sage's page is where the chat lives.
+      visibility: "hidden",
+      pluginMetadata: { sageId },
+    } as unknown as Parameters<typeof bb.sdk.threads.spawn>[0]);
+    const [turnStart = null] = chat.append(kind, inputText(request.input));
+    await bb.storage.kv.set(`cursor:${sageId}`, {
+      threadId: thread.id,
+      seq: 0,
+    } satisfies Cursor);
+    if (sage.threadId !== null) {
+      bb.sdk.threads.archive({ threadId: sage.threadId }).catch(() => {});
+    }
+    const { input: _input, ...selection } = request;
+    return updateSage(sageId, {
+      threadId: thread.id,
+      running: true,
+      turnStart,
+      error: null,
+      defaults: selection,
+    });
+  }
+
+  // --- Specialists ---
+
+  async function listSpecialists(): Promise<Specialist[] | null> {
+    try {
+      const { specialists } = await bb.sdk.plugins.callRpc({
+        pluginId: "specialists",
+        method: "specialists_list",
+        input: null,
+        outputSchema: z.object({ specialists: z.array(specialistSchema) }),
+      });
+      return specialists;
+    } catch (cause) {
+      bb.log.warn(`could not list specialists: ${errorText(cause)}`);
+      return null;
+    }
+  }
+
+  /** Specialist threads a sage handed work to, until they report back. */
+  interface Worker {
+    sageId: string;
+    specialist: string;
+  }
+  const workers = new Map(
+    Object.entries(
+      (await bb.storage.kv.get<Record<string, Worker>>("workers")) ?? {},
+    ),
+  );
+  const saveWorkers = () =>
+    bb.storage.kv.set("workers", Object.fromEntries(workers));
+  /** Reports sent into a running turn, so its log marks them as work. */
+  const reports = new Set<string>();
+
+  /**
+   * Brings a specialist's report into the sage's chat: between the tool
+   * calls of the running turn, or as a new turn when the sage is idle.
+   */
+  async function deliver(sageId: string, report: string): Promise<void> {
+    await drain(sageId);
+    const sage = findSage(sageId);
+    if (sage.running && sage.threadId !== null) {
+      reports.add(report);
+      await bb.sdk.threads.send({
+        threadId: sage.threadId,
+        mode: "auto",
+        input: [{ type: "text", text: report, mentions: [] }],
+      } as unknown as Parameters<typeof bb.sdk.threads.send>[0]);
+      return;
+    }
+    if (sage.defaults === null) {
+      throw new Error(`${sage.name} has no turn to report to`);
+    }
+    await send(
+      sageId,
+      turnRequestSchema.parse({
+        ...sage.defaults,
+        input: [{ type: "text", text: report, mentions: [] }],
+      }),
+      "work",
+    );
+  }
+  function workerDone(
+    threadId: string,
+    report: (name: string) => Promise<string>,
+  ) {
+    const worker = workers.get(threadId);
+    if (worker === undefined) return;
+    workers.delete(threadId);
+    saveWorkers().catch(() => {});
+    serial(worker.sageId, async () =>
+      deliver(worker.sageId, await report(worker.specialist)),
+    ).catch((cause) =>
+      bb.log.warn(`could not deliver a specialist report: ${errorText(cause)}`),
+    );
+  }
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
+    workerDone(thread.id, async (name) => {
+      const text =
+        lastAssistantText ??
+        JSON.stringify(await bb.sdk.threads.output({ threadId: thread.id }));
+      return `[${name}] report (thread ${thread.id}):\n${text}`;
+    }),
+  );
+  bb.events.on("thread.failed", ({ thread, error }) =>
+    workerDone(
+      thread.id,
+      async (name) =>
+        `[${name}] failed (thread ${thread.id}): ${error ?? "no error given"}`,
+    ),
+  );
+
+  function sageOfThread(threadId: string): Sage | undefined {
+    return sages.find((sage) => sage.threadId === threadId);
+  }
+  function follow(threadId: string, after?: (sage: Sage) => Promise<unknown>) {
+    const sage = sageOfThread(threadId);
+    if (sage === undefined) return;
+    serial(sage.id, async () => {
+      await drain(sage.id);
+      await after?.(sage);
+    }).catch((cause) => bb.log.warn(`logging failed: ${errorText(cause)}`));
+  }
+  bb.events.on("experimental_thread.events", ({ thread }) => follow(thread.id));
+  bb.events.on("thread.idle", ({ thread }) =>
+    follow(thread.id, async (sage) => {
+      await updateSage(sage.id, {
+        running: false,
+        // The next turn works where this one did. The environment exists
+        // only once the thread has started, so it is read here.
+        ...(thread.environmentId == null
+          ? {}
+          : {
+              defaults: {
+                ...findSage(sage.id).defaults,
+                environment: {
+                  type: "reuse",
+                  environmentId: thread.environmentId,
+                },
+              },
+            }),
+      });
+      // A hidden thread's runtime is released by hand; the thread is kept.
+      await bb.sdk.threads.stop({ threadId: thread.id }).catch(() => {});
+    }),
+  );
+  bb.events.on("thread.failed", ({ thread, error }) =>
+    follow(thread.id, (sage) =>
+      updateSage(sage.id, {
+        running: false,
+        error: error ?? "The turn failed",
+      }),
+    ),
+  );
+  // Catch up on what happened while the plugin was not loaded.
+  for (const sage of sages) {
+    if (sage.threadId === null) continue;
+    const { threadId } = sage;
+    follow(threadId, async () => {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (sage.running && thread.status !== "active") {
+        await updateSage(sage.id, { running: false });
+      }
+    });
+  }
+
+  bb.rpc.register(rpcContract, {
+    sages_list: () => ({
+      sages: sages.map((sage) => ({ ...sage, stats: chatOf(sage.id).stats() })),
+    }),
+    sages_create: (input) => createSage(input),
+    sages_update: ({ id, ...patch }) => updateSage(id, patch),
+    sages_remove: async ({ id }) => ({ removed: await removeSage(id) }),
+    sages_send: ({ id, request }) => serial(id, () => send(id, request)),
+    sages_history: ({ id, before, limit }) => {
+      findSage(id);
+      return { messages: chatOf(id).history(before, limit) };
+    },
+  });
+
+  // --- The sage's agent: instructions and memory tools ---
+
+  /** The chat of the sage a thread belongs to, by the thread's metadata. */
+  async function chatOfThread(threadId: string): Promise<Chat> {
+    const { sageId } = (await bb.sdk.threads.getPluginMetadata({
+      threadId,
+    })) as { sageId?: unknown };
+    if (typeof sageId !== "string") throw new Error("Not a sage's thread");
+    findSage(sageId);
+    return chatOf(sageId);
+  }
+  const toolResult = async (work: () => Promise<string>) => {
+    try {
+      return await work();
+    } catch (cause) {
+      return {
+        content: [{ type: "text" as const, text: errorText(cause) }],
+        isError: true,
+      };
+    }
+  };
+  bb.agents.registerTool({
+    name: ZOOM_TOOL,
+    description:
+      "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole.",
+    instructions: TURN_PROMPT,
+    presentation: {
+      label: { pending: "Remembering", completed: "Remembered" },
+    },
+    parameters: z.object({
+      id: z.number().int().min(0).describe("The line's first message"),
+      n: z
+        .number()
+        .int()
+        .min(1)
+        .describe("How many messages the line covers: a power of 2"),
+    }),
+    execute: ({ id, n }, { threadId }) =>
+      toolResult(async () => (await chatOfThread(threadId)).zoom(id, n)),
+  });
+  bb.agents.registerTool({
+    name: DATE_TOOL,
+    description: "The date and time of message id.",
+    parameters: z.object({ id: z.number().int().min(0) }),
+    execute: ({ id }, { threadId }) =>
+      toolResult(async () => (await chatOfThread(threadId)).date(id)),
+  });
+  bb.agents.registerTool({
+    name: HANDOFF_TOOL,
+    description:
+      'Hand work to a specialist. It runs in its own thread in your workspace and its report reaches this chat as a message starting "[name]". Returns the thread\'s id; never wait for it.',
+    instructions: HANDOFF_PROMPT,
+    presentation: {
+      label: {
+        pending: "Handing off to specialist",
+        completed: "Handed off to specialist",
+      },
+    },
+    parameters: z.object({
+      specialist: z.string().min(1).describe("The specialist's name"),
+      task: z
+        .string()
+        .trim()
+        .min(1)
+        .max(100_000)
+        .describe(
+          "A self-contained brief: the specialist sees your workspace but none of this chat.",
+        ),
+    }),
+    execute: ({ specialist, task }, { threadId }) =>
+      toolResult(async () => {
+        const { sageId } = (await bb.sdk.threads.getPluginMetadata({
+          threadId,
+        })) as { sageId?: unknown };
+        if (typeof sageId !== "string") throw new Error("Not a sage's thread");
+        const sage = findSage(sageId);
+        const turn = await bb.sdk.threads.get({ threadId });
+        // No parent thread: bb would report the result to this turn's
+        // thread, which a later message may have replaced. The report is
+        // delivered to the sage's chat instead.
+        const { threadId: workerId } = await bb.sdk.plugins.callRpc({
+          pluginId: "specialists",
+          method: "specialists_handoff",
+          input: {
+            specialist,
+            task,
+            projectId: turn.projectId,
+            environmentId: turn.environmentId ?? null,
+            requestedBy: `The sage "${sage.name}" (a long-running chat agent)`,
+          },
+          outputSchema: z.object({ threadId: z.string() }),
+        });
+        workers.set(workerId, { sageId, specialist });
+        await saveWorkers();
+        return [
+          `Handed off to ${specialist} in thread ${workerId} (reference it to the user as @thread:${workerId}).`,
+          `Its report reaches this chat as a message starting "[${specialist}]". Do not wait for it or do its work meanwhile.`,
+        ].join("\n");
+      }),
+  });
+  // A thread is a sage's turn when its metadata names a sage. The metadata
+  // is writable by any client; all it unlocks is reading that sage's chat.
+  bb.agents.configure((context) => {
+    const { sageId } = context.pluginMetadata;
+    const sage = sages.find((candidate) => candidate.id === sageId);
+    return sage === undefined
+      ? { tools: [], skills: [] }
+      : {
+          tools: [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL],
+          skills: [],
+          instructions: sageInstructions(sage),
+        };
+  });
+
+  bb.onDispose(() => {
+    if (publishTimer !== null) clearTimeout(publishTimer);
+    for (const chat of chats.values()) chat.dispose();
+  });
+
+  // --- CLI ---
+
+  const usage = [
+    "Usage:",
+    "  bb sages list [--json]",
+    "  bb sages show <sage-id> [--json]",
+    "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--json]",
+    "  bb sages remove <sage-id> [--json]",
+  ].join("\n");
+  function formatSage(sage: Sage): string {
+    const topic = sage.topic === "" ? "" : `  — ${sage.topic}`;
+    return `${sage.id}  ${sage.name}${topic}`;
+  }
+  bb.cli.register({
+    name: "sages",
+    summary: "Manage sages: tuned chats bound to a topic or project",
+    commands: [
+      { name: "list", summary: "List sages", usage: "bb sages list [--json]" },
+      {
+        name: "show",
+        summary: "Show one sage, its instructions, and the size of its chat",
+        usage: "bb sages show <sage-id> [--json]",
+      },
+      {
+        name: "create",
+        summary: "Create a sage",
+        usage:
+          "bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--json]",
+      },
+      {
+        name: "remove",
+        summary: "Delete a sage and its whole chat",
+        usage: "bb sages remove <sage-id> [--json]",
+      },
+    ],
+    async run(argv) {
+      const flags: Record<string, string> = {};
+      const args: string[] = [];
+      let json = false;
+      for (let index = 0; index < argv.length; index += 1) {
+        const arg = argv[index]!;
+        if (arg === "--json") json = true;
+        else if (
+          arg === "--topic" ||
+          arg === "--instructions" ||
+          arg === "--project"
+        ) {
+          const value = argv[(index += 1)];
+          if (value === undefined) return { exitCode: 1, stderr: usage };
+          flags[arg.slice(2)] = value;
+        } else args.push(arg);
+      }
+      const [command, ...rest] = args;
+      const reply = (value: unknown, text: string) => ({
+        exitCode: 0,
+        stdout: json ? JSON.stringify(value) : text,
+      });
+      const sageId = rest[0];
+      try {
+        switch (command) {
+          case undefined:
+          case "help":
+          case "--help":
+            return { exitCode: 0, stdout: usage };
+          case "list":
+            return reply(
+              sages,
+              sages.length === 0
+                ? "No sages."
+                : sages.map(formatSage).join("\n"),
+            );
+          case "show": {
+            if (sageId === undefined || rest.length !== 1) break;
+            const sage = findSage(sageId);
+            const stats = chatOf(sageId).stats();
+            return reply(
+              { ...sage, stats },
+              [
+                formatSage(sage),
+                sage.projectId === null ? null : `project: ${sage.projectId}`,
+                `chat: ${stats.messages} messages, view ${stats.viewBytes} bytes, ${stats.pending} to summarize${sage.running ? ", working" : ""}`,
+                sage.instructions === "" ? null : `\n${sage.instructions}`,
+              ]
+                .filter((line) => line !== null)
+                .join("\n"),
+            );
+          }
+          case "create": {
+            const input = rpcContract.sages_create.input.safeParse({
+              name: rest.join(" "),
+              topic: flags.topic,
+              projectId: flags.project ?? null,
+              instructions: flags.instructions,
+            });
+            if (!input.success) {
+              return {
+                exitCode: 1,
+                stderr: `${z.prettifyError(input.error)}\n${usage}`,
+              };
+            }
+            const { projectId } = input.data;
+            if (projectId !== null) {
+              const projects = await bb.sdk.projects.list();
+              if (!projects.some((project) => project.id === projectId)) {
+                return {
+                  exitCode: 1,
+                  stderr: `No project with id ${projectId}. Run "bb project list" to see ids.`,
+                };
+              }
+            }
+            const sage = await createSage(input.data);
+            return reply(sage, `Created ${formatSage(sage)}`);
+          }
+          case "remove": {
+            if (sageId === undefined || rest.length !== 1) break;
+            findSage(sageId);
+            await removeSage(sageId);
+            return reply({ removed: true, id: sageId }, `Removed ${sageId}`);
+          }
+        }
+      } catch (cause) {
+        return {
+          exitCode: 1,
+          stderr: `${errorText(cause)}. Run "bb sages list" to see ids.`,
+        };
+      }
+      return { exitCode: 1, stderr: usage };
+    },
+  });
+}
