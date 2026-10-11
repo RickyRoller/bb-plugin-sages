@@ -95,6 +95,11 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string(), request: turnRequestSchema }),
     output: sageSchema,
   },
+  /** Stops the running turn. */
+  sages_stop: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+  },
   /** The user's and the sage's messages before `before`, oldest first. */
   sages_history: {
     input: z.object({
@@ -368,7 +373,11 @@ export default async function plugin(bb: BbPluginApi) {
     let chat = chats.get(sageId);
     if (chat === undefined) {
       chat = new Chat(db, sageId, summarize, (error) => {
-        if (error !== undefined) {
+        // An abort is a reload or shutdown, not a failure.
+        if (
+          error !== undefined &&
+          !(error instanceof Error && error.name === "AbortError")
+        ) {
           bb.log.warn(`compaction failed: ${errorText(error)}`);
         }
         publish();
@@ -434,7 +443,14 @@ export default async function plugin(bb: BbPluginApi) {
           // messages the user sends while the sage works.
           if (data.source !== "spawn") {
             const text = inputText(data.input);
-            chat.append(reports.delete(text) ? "work" : "user", text, date);
+            // bb heads a message sent on another thread's behalf with this.
+            const notice = text.replace(
+              /^\[bb message from thread:\S+\]\s*/u,
+              "",
+            );
+            const report = reports.get(notice)?.shift();
+            if (report === undefined) chat.append("user", text, date);
+            else chat.append("work", report, date);
           }
         } else if (item.type === "agentMessage") {
           chat.append("sage", String(item.text ?? ""), date);
@@ -455,7 +471,8 @@ export default async function plugin(bb: BbPluginApi) {
   async function send(
     sageId: string,
     request: z.infer<typeof turnRequestSchema>,
-    kind: Kind = "user",
+    /** For a turn that starts with a specialist's report. */
+    from?: { kind: Kind; log: string },
   ): Promise<Sage> {
     let sage = findSage(sageId);
     if (sage.running && sage.threadId !== null) {
@@ -466,6 +483,16 @@ export default async function plugin(bb: BbPluginApi) {
         await updateSage(sageId, { running: false });
       }
       sage = findSage(sageId);
+      if (sage.running && from === undefined) {
+        // A message sent while the sage works joins the running turn
+        // between its steps; its log records it as the user's.
+        await bb.sdk.threads.send({
+          threadId: sage.threadId!,
+          mode: "auto",
+          input: request.input,
+        } as unknown as Parameters<typeof bb.sdk.threads.send>[0]);
+        return sage;
+      }
       if (sage.running) {
         throw new Error(`${sage.name} is still working on the last message`);
       }
@@ -500,7 +527,10 @@ export default async function plugin(bb: BbPluginApi) {
       visibility: "hidden",
       pluginMetadata: { sageId },
     } as unknown as Parameters<typeof bb.sdk.threads.spawn>[0]);
-    const [turnStart = null] = chat.append(kind, inputText(request.input));
+    const [turnStart = null] = chat.append(
+      from?.kind ?? "user",
+      from?.log ?? inputText(request.input),
+    );
     await bb.storage.kv.set(`cursor:${sageId}`, {
       threadId: thread.id,
       seq: 0,
@@ -547,53 +577,78 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const saveWorkers = () =>
     bb.storage.kv.set("workers", Object.fromEntries(workers));
-  /** Reports sent into a running turn, so its log marks them as work. */
-  const reports = new Set<string>();
+  /**
+   * Reports sent into a running turn by their one-line notice, so its log
+   * records the whole report as work.
+   */
+  const reports = new Map<string, string[]>();
 
   /**
    * Brings a specialist's report into the sage's chat: between the tool
    * calls of the running turn, or as a new turn when the sage is idle.
    */
-  async function deliver(sageId: string, report: string): Promise<void> {
+  async function deliver(
+    sageId: string,
+    workerId: string,
+    notice: string,
+    report: string,
+  ): Promise<void> {
+    // The user sees one line from the specialist's thread; the agent gets
+    // the whole report, and so does the chat's log.
+    const input = [
+      { type: "text", text: notice, mentions: [] },
+      { type: "text", text: report, visibility: "agent-only", mentions: [] },
+    ];
     await drain(sageId);
     const sage = findSage(sageId);
     if (sage.running && sage.threadId !== null) {
-      reports.add(report);
+      reports.set(notice, [...(reports.get(notice) ?? []), report]);
       await bb.sdk.threads.send({
         threadId: sage.threadId,
         mode: "auto",
-        input: [{ type: "text", text: report, mentions: [] }],
+        input,
+        senderThreadId: workerId,
       } as unknown as Parameters<typeof bb.sdk.threads.send>[0]);
       return;
     }
     if (sage.defaults === null) {
       throw new Error(`${sage.name} has no turn to report to`);
     }
-    await send(
-      sageId,
-      turnRequestSchema.parse({
-        ...sage.defaults,
-        input: [{ type: "text", text: report, mentions: [] }],
-      }),
-      "work",
-    );
+    await send(sageId, turnRequestSchema.parse({ ...sage.defaults, input }), {
+      kind: "work",
+      log: report,
+    });
   }
   function workerDone(
     threadId: string,
+    outcome: string,
     report: (name: string) => Promise<string>,
   ) {
     const worker = workers.get(threadId);
     if (worker === undefined) return;
     workers.delete(threadId);
     saveWorkers().catch(() => {});
-    serial(worker.sageId, async () =>
-      deliver(worker.sageId, await report(worker.specialist)),
-    ).catch((cause) =>
+    serial(worker.sageId, async () => {
+      const text = await report(worker.specialist);
+      try {
+        await deliver(
+          worker.sageId,
+          threadId,
+          `${worker.specialist} ${outcome}`,
+          text,
+        );
+      } catch (cause) {
+        // Undelivered, the report still joins the chat, so the sage sees it
+        // in the view at its next turn.
+        chatOf(worker.sageId).append("work", text);
+        throw cause;
+      }
+    }).catch((cause) =>
       bb.log.warn(`could not deliver a specialist report: ${errorText(cause)}`),
     );
   }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
-    workerDone(thread.id, async (name) => {
+    workerDone(thread.id, "finished", async (name) => {
       const text =
         lastAssistantText ??
         JSON.stringify(await bb.sdk.threads.output({ threadId: thread.id }));
@@ -603,6 +658,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", ({ thread, error }) =>
     workerDone(
       thread.id,
+      "failed",
       async (name) =>
         `[${name}] failed (thread ${thread.id}): ${error ?? "no error given"}`,
     ),
@@ -670,6 +726,12 @@ export default async function plugin(bb: BbPluginApi) {
     sages_update: ({ id, ...patch }) => updateSage(id, patch),
     sages_remove: async ({ id }) => ({ removed: await removeSage(id) }),
     sages_send: ({ id, request }) => serial(id, () => send(id, request)),
+    sages_stop: async ({ id }) => {
+      const { threadId, running } = findSage(id);
+      if (!running || threadId === null) return { ok: false };
+      await bb.sdk.threads.stop({ threadId });
+      return { ok: true };
+    },
     sages_history: ({ id, before, limit }) => {
       findSage(id);
       return { messages: chatOf(id).history(before, limit) };

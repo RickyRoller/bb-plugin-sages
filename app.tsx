@@ -21,7 +21,6 @@ import {
   useRealtime,
   useRpc,
   useSdk,
-  type ExperimentalSidebarNavigationProps,
   type NewThreadComposerProps,
   type NewThreadRequest,
   type PluginNavPanelProps,
@@ -306,6 +305,26 @@ function useHistory(sageId: string, total: number) {
   return { messages, more, loadEarlier };
 }
 
+/** A specialist's report: one quiet line that opens the specialist's thread. */
+function WorkLine({ text }: { text: string }) {
+  const navigate = useBbNavigate();
+  const match = /^\[([^\]]+)\] (report|failed) \(thread (\S+)\)/u.exec(text);
+  const name = match?.[1] ?? "A specialist";
+  const threadId = match?.[3] ?? null;
+  const label = match?.[2] === "failed" ? "failed" : "reported back";
+  return (
+    <button
+      type="button"
+      disabled={threadId === null}
+      onClick={() => threadId !== null && navigate.toThread(threadId)}
+      className="flex items-center gap-1.5 self-start text-xs text-muted-foreground hover:text-foreground disabled:hover:text-muted-foreground"
+    >
+      <Icon name="CornerDownRight" className="size-3.5" />
+      <span className="font-medium">{name}</span> {label}
+    </button>
+  );
+}
+
 function Transcript({
   messages,
   more,
@@ -325,12 +344,7 @@ function Transcript({
       ) : null}
       {messages.map((message) =>
         message.kind === "work" ? (
-          <div
-            key={message.i}
-            className="rounded-lg border border-border bg-card px-4 py-3 text-sm"
-          >
-            <Markdown content={message.text} />
-          </div>
+          <WorkLine key={message.i} text={message.text} />
         ) : message.kind === "user" ? (
           <div
             key={message.i}
@@ -518,7 +532,7 @@ function SageChat({ sageId }: { sageId: string }) {
         </div>
       )}
       {editing ? (
-        <div className="mx-auto w-full max-w-3xl overflow-y-auto p-4">
+        <div className="mx-auto min-h-0 w-full max-w-3xl flex-1 overflow-y-auto p-4">
           <SageForm
             initial={sage}
             submitLabel="Save"
@@ -555,131 +569,64 @@ function SageChat({ sageId }: { sageId: string }) {
               <ThreadChat
                 key={liveThread}
                 threadId={liveThread}
-                permissionPolicy="inherit"
+                // Transcript only: the page's one composer stays put.
+                variant="timeline"
                 leadingContent={transcript(true)}
               />
             </div>
           )}
           {loadedThread !== null ? null : (
-            <>
-              <ScrollToEnd watch={sage.stats.messages}>
-                {transcript(false)}
-              </ScrollToEnd>
-              <div className="mx-auto w-full max-w-3xl px-4 pb-4">
-                {sage.error === null ? null : (
-                  <p role="alert" className="pb-2 text-sm text-destructive">
-                    The last turn failed: {sage.error}
-                  </p>
-                )}
-                {liveThread !== null ? (
-                  <p className="py-3 text-center text-sm text-muted-foreground">
-                    {sage.name} is thinking…
-                  </p>
-                ) : (
-                  <NewThreadComposer
-                    draftKey={`sage:${sage.id}`}
-                    placeholder={`Ask ${sage.name}…`}
-                    onSubmit={sendMessage}
-                    defaultProjectId={sage.projectId ?? seeds.projectId}
-                    defaultProviderId={seeds.providerId}
-                    defaultModel={seeds.model}
-                    defaultReasoningLevel={seeds.reasoningLevel}
-                    defaultServiceTier={seeds.serviceTier}
-                    defaultPermissionMode="full"
-                    defaultEnvironment={
-                      // The last turn's environment, unless the sage has
-                      // since been assigned another project.
-                      sage.projectId === null ||
-                      sage.projectId === seeds.projectId
-                        ? (seeds.environment as NewThreadComposerProps["defaultEnvironment"])
-                        : undefined
-                    }
-                  />
-                )}
-              </div>
-            </>
+            <ScrollToEnd watch={sage.stats.messages}>
+              {transcript(false)}
+            </ScrollToEnd>
           )}
         </div>
       )}
+      {/* One composer for the life of the page, in the same place whatever
+          the chat shows, so a draft survives turns starting and ending. */}
+      <div className="mx-auto w-full max-w-3xl px-4 pb-4">
+        {sage.error === null ? null : (
+          <p role="alert" className="pb-2 text-sm text-destructive">
+            The last turn failed: {sage.error}
+          </p>
+        )}
+        {sage.running ? (
+          <div className="flex items-center justify-between pb-2 text-xs text-muted-foreground">
+            <span>
+              {sage.name} is working. A message now reaches it between steps.
+            </span>
+            <Button
+              variant="ghost"
+              className="h-7 px-2 text-xs"
+              onClick={() => {
+                rpc.call("sages_stop", { id: sage.id }).catch(report);
+              }}
+            >
+              <Icon name="Square" className="size-3.5" />
+              Stop
+            </Button>
+          </div>
+        ) : null}
+        <NewThreadComposer
+          draftKey={`sage:${sage.id}`}
+          placeholder={`Ask ${sage.name}…`}
+          onSubmit={sendMessage}
+          defaultProjectId={sage.projectId ?? seeds.projectId}
+          defaultProviderId={seeds.providerId}
+          defaultModel={seeds.model}
+          defaultReasoningLevel={seeds.reasoningLevel}
+          defaultServiceTier={seeds.serviceTier}
+          defaultPermissionMode="full"
+          defaultEnvironment={
+            // The last turn's environment, unless the sage has since been
+            // assigned another project.
+            sage.projectId === null || sage.projectId === seeds.projectId
+              ? (seeds.environment as NewThreadComposerProps["defaultEnvironment"])
+              : undefined
+          }
+        />
+      </div>
     </div>
-  );
-}
-
-/** The app's current path, kept current across in-app navigation. */
-function usePathname(): string {
-  const [pathname, setPathname] = useState(window.location.pathname);
-  useEffect(() => {
-    // The Navigation API sees pushState routing; where it is missing the
-    // highlight updates on the next render instead.
-    const navigation = (window as { navigation?: EventTarget }).navigation;
-    const update = () =>
-      setTimeout(() => setPathname(window.location.pathname), 0);
-    navigation?.addEventListener("navigate", update);
-    window.addEventListener("popstate", update);
-    return () => {
-      navigation?.removeEventListener("navigate", update);
-      window.removeEventListener("popstate", update);
-    };
-  }, []);
-  return pathname;
-}
-
-/**
- * bb's own navigation rows, then the sages, so the sages sit above the
- * thread list and its Pinned section.
- */
-function SidebarNavigation({
-  experimental_Original: Original,
-}: ExperimentalSidebarNavigationProps) {
-  const { sages } = useSages();
-  const navigate = useBbNavigate();
-  const pathname = usePathname();
-  return (
-    <>
-      <Original />
-      {sages === null || sages.length === 0 ? null : (
-        <section className="mt-2 pb-1">
-          <div className="mx-2 px-2.5 py-1 text-xs font-medium text-muted-foreground">
-            Sages
-          </div>
-          <div className="space-y-0.5">
-            {sages.map((sage) => {
-              const active = pathname.endsWith(`/${PANEL_PATH}/${sage.id}`);
-              return (
-                <a
-                  key={sage.id}
-                  href="#"
-                  aria-current={active ? "page" : undefined}
-                  className={`mx-2 flex min-w-0 items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring ${
-                    active
-                      ? "bg-accent text-accent-foreground"
-                      : "hover:bg-accent/60"
-                  }`}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    navigate.toPluginPanel(PANEL_PATH, { subPath: sage.id });
-                  }}
-                >
-                  <Icon
-                    name="Sparkles"
-                    className="size-4 shrink-0 text-muted-foreground"
-                  />
-                  <span className="min-w-0 flex-1 truncate font-medium">
-                    {sage.name}
-                  </span>
-                  {sage.running ? (
-                    <span
-                      aria-label="Working"
-                      className="size-1.5 shrink-0 animate-pulse rounded-full bg-primary"
-                    />
-                  ) : null}
-                </a>
-              );
-            })}
-          </div>
-        </section>
-      )}
-    </>
   );
 }
 
@@ -695,11 +642,5 @@ export default definePluginApp((app) => {
     icon: "Sparkles",
     path: PANEL_PATH,
     component: SagesPage,
-  });
-  app.slots.experimental_sidebarNavigation({
-    id: "sages-navigation",
-    title: "Navigation with Sages",
-    description: "bb's navigation, with your sages listed below it.",
-    component: SidebarNavigation,
   });
 });
