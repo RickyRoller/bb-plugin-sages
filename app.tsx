@@ -25,6 +25,7 @@ import {
   type NewThreadRequest,
   type PluginNavPanelProps,
 } from "@get-bb/plugin-sdk/app";
+import { z } from "zod";
 import type { ListedSage as Sage, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -263,6 +264,8 @@ interface ChatMessage {
   date: string;
 }
 const PAGE = 40;
+/** The reading column bb's own chats use. */
+const CHAT_COLUMN = "mx-auto w-full max-w-[760px] px-4";
 
 /**
  * The logged chat: the user's and the sage's messages, newest page first,
@@ -336,7 +339,7 @@ function Transcript({
 }) {
   if (messages.length === 0) return null;
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-4">
+    <div className="flex flex-col gap-4 px-2 py-4">
       {more ? (
         <Button variant="ghost" className="self-center" onClick={onLoadEarlier}>
           Load earlier messages
@@ -391,9 +394,11 @@ function useLoadedThread(threadId: string | null): string | null {
 /** A scroll area that stays at its end as `watch` changes. */
 function ScrollToEnd({
   watch,
+  className,
   children,
 }: {
   watch: unknown;
+  className: string;
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -413,7 +418,7 @@ function ScrollToEnd({
   return (
     <div
       ref={ref}
-      className="min-h-0 flex-1 overflow-y-auto"
+      className={className}
       onScroll={(event) => {
         const area = event.currentTarget;
         atEnd.current =
@@ -489,7 +494,7 @@ function SageChat({ sageId }: { sageId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
-      <header className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
         <Button
           variant="ghost"
           size="icon"
@@ -532,59 +537,70 @@ function SageChat({ sageId }: { sageId: string }) {
         </div>
       )}
       {editing ? (
-        <div className="mx-auto min-h-0 w-full max-w-3xl flex-1 overflow-y-auto p-4">
-          <SageForm
-            initial={sage}
-            submitLabel="Save"
-            onCancel={() => setEditing(false)}
-            onSubmit={async ({ name, topic, instructions, projectId }) => {
-              try {
-                await rpc.call("sages_update", {
-                  id: sage.id,
-                  name,
-                  topic,
-                  projectId,
-                  instructions,
-                });
-                setEditing(false);
-              } catch (cause) {
-                report(cause);
-              }
-            }}
-          />
-          <p className="mt-2 text-xs text-muted-foreground">
-            Changes apply from the next message.
-          </p>
+        <div className="min-h-0 flex-1 overflow-y-auto py-4">
+          <div className={CHAT_COLUMN}>
+            <SageForm
+              initial={sage}
+              submitLabel="Save"
+              onCancel={() => setEditing(false)}
+              onSubmit={async ({ name, topic, instructions, projectId }) => {
+                try {
+                  await rpc.call("sages_update", {
+                    id: sage.id,
+                    name,
+                    topic,
+                    projectId,
+                    instructions,
+                  });
+                  setEditing(false);
+                } catch (cause) {
+                  report(cause);
+                }
+              }}
+            />
+            <p className="mt-2 text-xs text-muted-foreground">
+              Changes apply from the next message.
+            </p>
+          </div>
         </div>
       ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">
           {liveThread === null ? null : (
-            <div
+            // Mounted out of sight until it has loaded, then shown in place,
+            // so it never remounts and never flashes skeletons.
+            <ScrollToEnd
+              watch={loadedThread}
               className={
                 loadedThread === null
-                  ? "invisible absolute inset-0"
-                  : "min-h-0 flex-1"
+                  ? "invisible absolute inset-0 overflow-y-auto"
+                  : "min-h-0 flex-1 overflow-y-auto"
               }
             >
-              <ThreadChat
-                key={liveThread}
-                threadId={liveThread}
-                // Transcript only: the page's one composer stays put.
-                variant="timeline"
-                leadingContent={transcript(true)}
-              />
-            </div>
+              <div className={CHAT_COLUMN}>
+                <ThreadChat
+                  key={liveThread}
+                  threadId={liveThread}
+                  // Transcript only: the page's one composer stays put.
+                  variant="timeline"
+                  layout="document"
+                  leadingContent={transcript(true)}
+                />
+              </div>
+            </ScrollToEnd>
           )}
           {loadedThread !== null ? null : (
-            <ScrollToEnd watch={sage.stats.messages}>
-              {transcript(false)}
+            <ScrollToEnd
+              watch={sage.stats.messages}
+              className="min-h-0 flex-1 overflow-y-auto"
+            >
+              <div className={CHAT_COLUMN}>{transcript(false)}</div>
             </ScrollToEnd>
           )}
         </div>
       )}
       {/* One composer for the life of the page, in the same place whatever
           the chat shows, so a draft survives turns starting and ending. */}
-      <div className="mx-auto w-full max-w-3xl px-4 pb-4">
+      <div className={`${CHAT_COLUMN} shrink-0 pb-4`}>
         {sage.error === null ? null : (
           <p role="alert" className="pb-2 text-sm text-destructive">
             The last turn failed: {sage.error}
@@ -630,6 +646,235 @@ function SageChat({ sageId }: { sageId: string }) {
   );
 }
 
+// --- Dev services ---
+// bb offers thread side-panel tools only on thread pages, and a sage page
+// has no thread. This tab drives the Dev Services plugin for the sage's
+// project instead, over that plugin's RPC.
+
+const devStatusSchema = z
+  .object({
+    projectName: z.string(),
+    commands: z.array(
+      z.object({
+        name: z.string(),
+        status: z.string(),
+        exitCode: z.number().nullable(),
+        output: z.string(),
+      }),
+    ),
+    services: z.array(
+      z.object({
+        name: z.string(),
+        port: z.number(),
+        running: z.boolean(),
+        url: z.string().nullable(),
+      }),
+    ),
+  })
+  .nullable();
+type DevStatus = z.infer<typeof devStatusSchema>;
+const DEV_POLL_MS = 3000;
+// CSI/OSC escape sequences and carriage returns from the PTY stream.
+// eslint-disable-next-line no-control-regex
+const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007|\r/g;
+
+function StatusDot({ on }: { on: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`size-2 shrink-0 rounded-full ${on ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
+    />
+  );
+}
+
+function SageDevServices({ subPath }: PluginNavPanelProps) {
+  const sdk = useSdk();
+  const navigate = useBbNavigate();
+  const { sages } = useSages();
+  const sage = sages?.find((each) => each.id === subPath.split("/")[0]);
+  const projectId =
+    sage?.projectId ??
+    (typeof sage?.defaults?.projectId === "string"
+      ? sage.defaults.projectId
+      : null);
+  // undefined while loading; null when the project registers no services.
+  const [status, setStatus] = useState<DevStatus | undefined>();
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<"start" | "stop" | null>(null);
+
+  const call = useCallback(
+    (method: "status" | "start" | "stop") =>
+      sdk.plugins.callRpc({
+        pluginId: "dev-services",
+        method,
+        input: { projectId },
+        outputSchema: devStatusSchema,
+      }),
+    [sdk, projectId],
+  );
+  const refresh = useCallback(() => {
+    if (projectId === null) return;
+    call("status").then(
+      (next) => {
+        setStatus(next);
+        setError(null);
+      },
+      (cause: unknown) =>
+        setError(cause instanceof Error ? cause.message : String(cause)),
+    );
+  }, [call, projectId]);
+  useEffect(() => {
+    setStatus(undefined);
+    refresh();
+    const timer = window.setInterval(refresh, DEV_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  if (sage === undefined) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Open a sage to see its project's dev services.
+      </p>
+    );
+  }
+  if (projectId === null) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        {sage.name} has no project. Assign one with the pencil button, or send a
+        message in a project, to use its dev services.
+      </p>
+    );
+  }
+  if (status === null) {
+    return (
+      <div className="space-y-2 text-sm text-muted-foreground">
+        <p>This project hasn't registered any dev services.</p>
+        <p className="text-xs">
+          Add a <code>.bb-dev-services.json</code> file at the repository root
+          to register commands.
+        </p>
+      </div>
+    );
+  }
+
+  const run = async (action: "start" | "stop") => {
+    setPending(action);
+    try {
+      setStatus(await call(action));
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPending(null);
+    }
+  };
+  const active = (state: string) => state === "running" || state === "starting";
+  const allActive =
+    status !== undefined &&
+    status.commands.every((command) => active(command.status));
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold">Dev services</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {status?.projectName ?? "Loading…"}
+          </p>
+        </div>
+        <Button
+          aria-label="Refresh status"
+          disabled={pending !== null}
+          onClick={refresh}
+          size="icon"
+          variant="ghost"
+        >
+          <Icon name="RefreshCw" className="size-4" />
+        </Button>
+      </div>
+      {error === null ? null : (
+        <p
+          role="alert"
+          className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive"
+        >
+          {error}
+        </p>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          disabled={pending !== null || status === undefined || allActive}
+          onClick={() => void run("start")}
+        >
+          {pending === "start" ? "Starting…" : "Start"}
+        </Button>
+        <Button
+          disabled={pending !== null || status === undefined}
+          onClick={() => void run("stop")}
+          variant="outline"
+        >
+          {pending === "stop" ? "Stopping…" : "Stop"}
+        </Button>
+      </div>
+      {status === undefined || status.services.length === 0 ? null : (
+        <section className="space-y-2 rounded-lg border border-border bg-card p-3 text-card-foreground">
+          <h3 className="text-xs font-semibold">Services</h3>
+          {status.services.map((service) => (
+            <div
+              key={service.port}
+              className="flex items-center justify-between gap-2 text-sm"
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <StatusDot on={service.running} />
+                <span className="truncate">{service.name}</span>
+                <span className="font-mono text-xs text-muted-foreground">
+                  :{service.port}
+                </span>
+              </span>
+              {service.url === null ? null : (
+                <Button
+                  disabled={!service.running}
+                  onClick={() =>
+                    service.url !== null && navigate.openUrl(service.url)
+                  }
+                  size="sm"
+                  variant="secondary"
+                >
+                  Open ↗
+                </Button>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
+      {status?.commands.map((command) => (
+        <details
+          key={command.name}
+          className="rounded-lg border border-border bg-card text-card-foreground"
+        >
+          <summary className="flex cursor-pointer items-center justify-between gap-2 p-3 text-sm">
+            <span className="flex items-center gap-2">
+              <StatusDot on={command.status === "running"} />
+              {command.name}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {command.status === "exited"
+                ? `exited (${command.exitCode ?? "?"})`
+                : command.status}
+            </span>
+          </summary>
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-b-lg bg-muted p-3 font-mono text-[11px] leading-snug text-muted-foreground">
+            {command.output
+              .replace(ANSI, "")
+              .split("\n")
+              .slice(-60)
+              .join("\n") || "No output yet."}
+          </pre>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 function SagesPage({ subPath }: PluginNavPanelProps) {
   const sageId = subPath.split("/")[0] ?? "";
   return sageId === "" ? <SageList /> : <SageChat sageId={sageId} />;
@@ -642,5 +887,14 @@ export default definePluginApp((app) => {
     icon: "Sparkles",
     path: PANEL_PATH,
     component: SagesPage,
+    fixedTabs: [
+      {
+        panelId: "sages",
+        id: "dev-services",
+        title: "Dev services",
+        icon: "Server",
+        component: SageDevServices,
+      },
+    ],
   });
 });

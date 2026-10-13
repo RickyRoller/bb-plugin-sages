@@ -95,6 +95,11 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string(), request: turnRequestSchema }),
     output: sageSchema,
   },
+  /** Puts sages in this order; ids left out keep their place after these. */
+  sages_reorder: {
+    input: z.object({ ids: z.array(z.string()).max(1000) }),
+    output: z.object({ ids: z.array(z.string()) }),
+  },
   /** Stops the running turn. */
   sages_stop: {
     input: z.object({ id: z.string() }),
@@ -726,6 +731,14 @@ export default async function plugin(bb: BbPluginApi) {
     sages_update: ({ id, ...patch }) => updateSage(id, patch),
     sages_remove: async ({ id }) => ({ removed: await removeSage(id) }),
     sages_send: ({ id, request }) => serial(id, () => send(id, request)),
+    sages_reorder: async ({ ids }) => {
+      const rank = new Map(ids.map((id, index) => [id, index]));
+      const ordered = [...sages].sort(
+        (a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity),
+      );
+      await writeSages(ordered);
+      return { ids: ordered.map((sage) => sage.id) };
+    },
     sages_stop: async ({ id }) => {
       const { threadId, running } = findSage(id);
       if (!running || threadId === null) return { ok: false };
