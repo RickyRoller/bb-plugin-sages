@@ -23,7 +23,7 @@ const WINDOW = 8;
 const TRIES = 5;
 const UNBUILT = "(not summarized yet: zoom it)";
 
-export type Kind = "user" | "sage" | "tool" | "echo" | "work";
+export type Kind = "user" | "sage" | "tool" | "echo" | "work" | "acolyte";
 /** Tree node (l, i): the 2^l messages from i·2^l on. */
 export type Ref = [l: number, i: number];
 export interface Message {
@@ -192,7 +192,7 @@ export class Chat {
         "INSERT INTO views (sage, state) VALUES (?, ?) ON CONFLICT (sage) DO UPDATE SET state = excluded.state",
       ),
       history: db.prepare(
-        "SELECT i, kind, text, date FROM messages WHERE sage = ? AND kind IN ('user', 'sage', 'work') AND i < ? ORDER BY i DESC LIMIT ?",
+        "SELECT i, kind, text, date FROM messages WHERE sage = ? AND kind IN ('user', 'sage', 'work', 'acolyte') AND i < ? ORDER BY i DESC LIMIT ?",
       ),
     };
     const { count } = db

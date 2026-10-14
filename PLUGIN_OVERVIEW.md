@@ -6,6 +6,9 @@ ends and never needs compacting.
 - A **Sages** page in the left sidebar that creates, edits, and removes sages.
 - One endless chat per sage, with BB's own composer, models, attachments, and
   permissions.
+- Acolytes: sages under a lead sage, each focused on one part of its work, with
+  the lead's memory and a chat of their own. Keep one for good, or close it and
+  send its summary back to the lead.
 - A `bb sages` command that lists, shows, creates, and removes sages from a
   terminal.
 

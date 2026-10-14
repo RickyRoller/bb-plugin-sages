@@ -7,8 +7,9 @@ instructions, and one chat that never ends.
 - `optchat.ts` — the memory engine: the message log, the tree of summaries,
   the view, and the compactor. It knows nothing about BB.
 - `prompts.ts` — the turn and compaction prompts.
-- `server.ts` — the backend: sage records, turns, logging of what a turn's
-  thread does, the `sage_zoom` and `sage_date` tools, the compaction model
+- `server.ts` — the backend: sage records and their acolytes, turns, logging
+  of what a turn's thread does, the `sage_zoom`, `sage_date`, `sage_handoff`
+  and `sage_acolyte` tools, the compaction model
   call, RPC for the page, and the `bb sages` CLI.
 - `app.tsx` — the frontend: a **Sages** page in the left sidebar. Its root
   lists and creates sages; `/plugins/sages/sages/<sage-id>` is that sage's
@@ -42,6 +43,34 @@ the chat itself is the memory.
   turn when the sage is idle. The handoff uses the Specialists plugin's
   `specialists_handoff` RPC with no parent thread, since a later message may
   have replaced the turn that asked.
+
+## Acolytes
+
+An acolyte is a sage under a lead sage, focused on one part of its work: a
+parallel task, a side subject, or a lasting area such as one app inside a
+project. It is a sage of its own (`parentId` names its lead, and its topic is
+its focus), with its own chat and its own instructions. Its turns also get the
+lead's instructions and, before its own view, the lead's view inside `<main>`
+tags, so it keeps the lead's whole memory. It reads that view with
+`sage_zoom(id, n, "main")` and `sage_date(id, "main")`. Acolytes cannot have
+acolytes.
+
+- **Opening.** The lead opens one with `sage_acolyte(name, focus, brief?)`,
+  which its instructions allow only when the user asks for an acolyte, by that
+  word or plainly. With a brief it starts working at once. The user can open
+  one with the branch button on the lead's page, create one with a lead in the
+  create form, or move an existing sage under a lead with the edit form or
+  `bb sages lead <sage-id> <lead-id|none>`.
+- **In the lead's chat.** Openings and moves are `acolyte` messages, shown as
+  collapsible rows with the acolyte's status. Active acolytes also show as
+  chips above the composer, are listed to the lead each turn, and appear under
+  the lead in the Sages list and the sidebar.
+- **Closing.** Acolytes can last forever. From an acolyte's page, Close
+  either sends a summary or just archives it. A summary is written by the
+  compaction model from the acolyte's chat and delivered like a specialist's
+  report: into the running turn, or as a new turn. A closed acolyte stays
+  readable and can be reopened. A specialist's report for a closed acolyte
+  goes to the lead.
 
 The page shows the logged chat. BB's `NewThreadComposer` sends the next
 message, and BB's `ThreadChat` shows the turn while it runs, so messages sent

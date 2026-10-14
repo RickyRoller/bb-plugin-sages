@@ -13,7 +13,13 @@ import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
-import { COMPACTION_PROMPT, HANDOFF_PROMPT, TURN_PROMPT } from "./prompts";
+import {
+  COMPACTION_PROMPT,
+  HANDOFF_PROMPT,
+  ACOLYTE_PROMPT,
+  ACOLYTE_SUMMARY_PROMPT,
+  TURN_PROMPT,
+} from "./prompts";
 
 const sageSchema = z.object({
   id: z.string(),
@@ -34,6 +40,15 @@ const sageSchema = z.object({
   error: z.string().nullable().default(null),
   /** The latest turn's selections, to seed the next composer. */
   defaults: z.record(z.string(), z.unknown()).nullable().default(null),
+  /**
+   * For an acolyte: its lead sage, whose chat it reads as memory. An
+   * acolyte's topic is its focus within the lead's work.
+   */
+  parentId: z.string().nullable().default(null),
+  /** When the acolyte was closed; it is kept, read-only, until reopened. */
+  archivedAt: z.string().nullable().default(null),
+  /** Whether the acolyte's closing summary is being written. */
+  closing: z.boolean().default(false),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -69,6 +84,8 @@ export const rpcContract = defineRpcContract({
   sages_create: {
     input: z.object({
       name: nameInput,
+      /** Creates it as an acolyte of this sage. */
+      parentId: z.string().nullable().default(null),
       topic: topicInput.default(""),
       instructions: instructionsInput.default(""),
       projectId: z.string().nullable().default(null),
@@ -78,6 +95,8 @@ export const rpcContract = defineRpcContract({
   sages_update: {
     input: z.object({
       id: z.string(),
+      /** Makes the sage an acolyte of this sage, or with null, its own lead. */
+      parentId: z.string().nullable().optional(),
       name: nameInput.optional(),
       topic: topicInput.optional(),
       instructions: instructionsInput.optional(),
@@ -116,12 +135,29 @@ export const rpcContract = defineRpcContract({
       messages: z.array(
         z.object({
           i: z.number(),
-          kind: z.enum(["user", "sage", "tool", "echo", "work"]),
+          kind: z.enum(["user", "sage", "tool", "echo", "work", "acolyte"]),
           text: z.string(),
           date: z.string(),
         }),
       ),
     }),
+  },
+  /** Opens an acolyte of a sage from the UI, empty, for the user to start. */
+  sages_open_acolyte: {
+    input: z.object({ id: z.string(), name: nameInput, focus: topicInput }),
+    output: sageSchema,
+  },
+  /**
+   * Closes an acolyte: archived as is, or after a summary of it is sent to
+   * its sage's main chat.
+   */
+  sages_close_acolyte: {
+    input: z.object({ id: z.string(), summary: z.boolean() }),
+    output: sageSchema,
+  },
+  sages_reopen_acolyte: {
+    input: z.object({ id: z.string() }),
+    output: sageSchema,
   },
 });
 
@@ -130,6 +166,7 @@ const SAGES_CHANGED = "sages-changed";
 const ZOOM_TOOL = "sage_zoom";
 const DATE_TOOL = "sage_date";
 const HANDOFF_TOOL = "sage_handoff";
+const ACOLYTE_TOOL = "sage_acolyte";
 
 /** A specialist, as the Specialists plugin lists it. */
 const specialistSchema = z.looseObject({
@@ -216,6 +253,16 @@ function toolTexts(item: Record<string, unknown>): {
   };
 }
 
+/** The head of an acolyte's marker in its sage's main chat. */
+const acolyteHead = (
+  acolyte: Sage,
+  event: "opened" | "closed" | "archived" | "reopened" | "joined" | "left",
+) => `[acolyte ${acolyte.id}] ${event}: ${acolyte.name}`;
+
+/** The main chat's view as an acolyte's turn sees it, apart from its own. */
+const mainView = (view: string) =>
+  view.replace(/^<chat>/u, "<main>").replace(/<\/chat>$/u, "</main>");
+
 const errorText = (cause: unknown) =>
   cause instanceof Error ? cause.message : String(cause);
 
@@ -285,6 +332,25 @@ export default async function plugin(bb: BbPluginApi) {
     );
     return sage;
   }
+  /** Creates a sage, as an acolyte of its lead if one is given. */
+  async function createUnder({
+    parentId,
+    ...fields
+  }: Pick<
+    Sage,
+    "name" | "topic" | "instructions" | "projectId" | "parentId"
+  >): Promise<Sage> {
+    if (parentId !== null) findSage(parentId);
+    const sage = await createSage(fields);
+    if (parentId === null) return sage;
+    try {
+      await moveSage(sage.id, parentId);
+    } catch (cause) {
+      await removeSage(sage.id);
+      throw cause;
+    }
+    return findSage(sage.id);
+  }
   async function createSage(
     fields: Pick<Sage, "name" | "topic" | "instructions" | "projectId">,
   ): Promise<Sage> {
@@ -321,16 +387,25 @@ export default async function plugin(bb: BbPluginApi) {
     });
     return claude;
   }
-  const summarize: Summarize = async (conversation, signal) => {
+  const summarize: Summarize = (conversation, signal) =>
+    // A retry is the same conversation, resent whole in one prompt.
+    runClaude(
+      COMPACTION_PROMPT,
+      conversation
+        .map((message, index) =>
+          index % 2 === 0 ? message : `Your line was:\n${message}`,
+        )
+        .join("\n\n"),
+      signal,
+    );
+  async function runClaude(
+    system: string,
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<string> {
     const { compactionModel, compactionEffort, claudePath } =
       await settings.get();
     const command = await findClaude(claudePath);
-    // A retry is the same conversation, resent whole in one prompt.
-    const prompt = conversation
-      .map((message, index) =>
-        index % 2 === 0 ? message : `Your line was:\n${message}`,
-      )
-      .join("\n\n");
     return new Promise((resolve, reject) => {
       const child = spawn(
         command,
@@ -338,7 +413,7 @@ export default async function plugin(bb: BbPluginApi) {
           "-p",
           ...["--model", compactionModel],
           ...["--effort", compactionEffort],
-          ...["--system-prompt", COMPACTION_PROMPT],
+          ...["--system-prompt", system],
           ...["--tools", ""],
           ...["--setting-sources", ""],
           "--strict-mcp-config",
@@ -369,7 +444,7 @@ export default async function plugin(bb: BbPluginApi) {
       child.stdin.on("error", () => {});
       child.stdin.end(prompt);
     });
-  };
+  }
 
   // --- Chats ---
 
@@ -391,15 +466,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
     return chat;
   }
-  /** Deletes the sage and its chat; its turn threads stay in bb, archived. */
+  /**
+   * Deletes the sage and its chat, and its acolytes; their turn threads stay
+   * in bb, archived.
+   */
   async function removeSage(id: string): Promise<boolean> {
     if (!sages.some((sage) => sage.id === id)) return false;
+    for (const acolyte of sages.filter((sage) => sage.parentId === id)) {
+      await removeSage(acolyte.id);
+    }
     const { threadId } = findSage(id);
     if (threadId !== null) bb.sdk.threads.archive({ threadId }).catch(() => {});
     chatOf(id).destroy();
     chats.delete(id);
     await bb.storage.kv.delete(`cursor:${id}`);
     await writeSages(sages.filter((sage) => sage.id !== id));
+    nudgeSidebar();
     return true;
   }
 
@@ -455,7 +537,7 @@ export default async function plugin(bb: BbPluginApi) {
             );
             const report = reports.get(notice)?.shift();
             if (report === undefined) chat.append("user", text, date);
-            else chat.append("work", report, date);
+            else chat.append(report.kind, report.text, date);
           }
         } else if (item.type === "agentMessage") {
           chat.append("sage", String(item.text ?? ""), date);
@@ -480,6 +562,9 @@ export default async function plugin(bb: BbPluginApi) {
     from?: { kind: Kind; log: string },
   ): Promise<Sage> {
     let sage = findSage(sageId);
+    if (sage.archivedAt !== null) {
+      throw new Error(`The acolyte "${sage.name}" is closed; reopen it first`);
+    }
     if (sage.running && sage.threadId !== null) {
       // The flag follows the thread's events; ask the thread before refusing.
       await drain(sageId);
@@ -510,19 +595,16 @@ export default async function plugin(bb: BbPluginApi) {
     // goes whole after it. Per-turn state follows the view, so the view
     // stays a stable prefix from one turn to the next.
     const view = chat.render();
-    // Read now, so every turn sees the specialists as they are.
-    const specialists = await listSpecialists();
     const thread = await bb.sdk.threads.spawn({
       ...(request as Record<string, unknown>),
       projectId: request.projectId,
       input: [
-        { type: "text", text: view, visibility: "agent-only", mentions: [] },
-        {
+        ...(await turnContext(sage, view)).map((text) => ({
           type: "text",
-          text: `Date: ${new Date().toString()}\n\n${specialistsText(specialists)}`,
+          text,
           visibility: "agent-only",
           mentions: [],
-        },
+        })),
         ...request.input,
       ],
       title: sage.name,
@@ -551,6 +633,270 @@ export default async function plugin(bb: BbPluginApi) {
       error: null,
       defaults: selection,
     });
+  }
+
+  /**
+   * What a turn sees before the user's message: the views, then the state of
+   * the world, which is read now so every turn sees it as it is.
+   */
+  async function turnContext(sage: Sage, view: string): Promise<string[]> {
+    const specialists = specialistsText(await listSpecialists());
+    const date = `Date: ${new Date().toString()}`;
+    if (sage.parentId === null) {
+      const open = sages.filter(
+        (acolyte) =>
+          acolyte.parentId === sage.id && acolyte.archivedAt === null,
+      );
+      const acolytes =
+        open.length === 0
+          ? "Your acolytes: none."
+          : [
+              "Your acolytes:",
+              ...open.map(
+                (acolyte) =>
+                  `- "${acolyte.name}" (acolyte ${acolyte.id}, since ${acolyte.createdAt}${acolyte.running ? ", working" : ""}): ${acolyte.topic || "no focus given"}`,
+              ),
+            ].join("\n");
+      return [view, [date, acolytes, specialists].join("\n\n")];
+    }
+    const parent = findSage(sage.parentId);
+    const acolyte = [
+      `You are ${sage.name}, an acolyte of ${parent.name}: a sage under it, focused on ${sage.topic === "" ? "one part of its work" : sage.topic}. ${parent.name}'s chat comes first, inside <main> tags, then your own view.`,
+      `Both are your memory: zoom ${parent.name}'s with "main". Keep to your focus, and you cannot open acolytes. When a piece of work is done, say so: the user may go on here, or close this chat and send its summary to ${parent.name}.`,
+      parent.instructions === ""
+        ? null
+        : `\n# ${parent.name}'s instructions, which you follow too\n${parent.instructions}`,
+    ]
+      .filter((line) => line !== null)
+      .join(" ");
+    return [
+      mainView(chatOf(parent.id).render()),
+      view,
+      [date, acolyte, specialists].join("\n\n"),
+    ];
+  }
+
+  // --- Acolytes ---
+
+  /**
+   * Tells the sidebar's Sages section, which loads only on demand, that the
+   * acolytes changed. Without that plugin there is nothing to tell.
+   */
+  function nudgeSidebar(): void {
+    bb.sdk.plugins
+      .callRpc({
+        pluginId: "sidebar-thread-details",
+        method: "refreshSages",
+        input: {},
+        outputSchema: z.unknown(),
+      })
+      .catch(() => {});
+  }
+
+  async function openAcolyte(
+    parentId: string,
+    name: string,
+    focus: string,
+    /** The sage's brief, which the acolyte starts working on at once. */
+    brief: string | null,
+    /** Where the opening turn works: the main chat's running turn's place. */
+    place?: { projectId: string; environmentId: string | null },
+  ): Promise<Sage> {
+    const parent = findSage(parentId);
+    if (parent.parentId !== null) {
+      throw new Error("An acolyte cannot open acolytes of its own");
+    }
+    const now = new Date().toISOString();
+    const acolyte = sageSchema.parse({
+      id: randomUUID().slice(0, 8),
+      name,
+      topic: focus,
+      // The lead's instructions reach it with every turn; these are its own.
+      instructions: "",
+      projectId: parent.projectId,
+      parentId,
+      defaults:
+        place === undefined
+          ? parent.defaults
+          : {
+              ...parent.defaults,
+              projectId: place.projectId,
+              ...(place.environmentId === null
+                ? {}
+                : {
+                    environment: {
+                      type: "reuse",
+                      environmentId: place.environmentId,
+                    },
+                  }),
+            },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await writeSages([...sages, acolyte]);
+    nudgeSidebar();
+    const about = [
+      focus === "" ? null : `Focus: ${focus}`,
+      brief ??
+        (place === undefined
+          ? "Opened by the user."
+          : `Opened by ${parent.name}, for the user to start.`),
+    ]
+      .filter((line) => line !== null)
+      .join("\n\n");
+    chatOf(parentId).append(
+      "acolyte",
+      `${acolyteHead(acolyte, "opened")}\n\n${about}`,
+    );
+    const opening = `[acolyte of ${parent.name}] opened: ${name}\n\n${about}`;
+    if (brief === null || acolyte.defaults === null) {
+      chatOf(acolyte.id).append("acolyte", opening);
+      return acolyte;
+    }
+    return serial(acolyte.id, () =>
+      send(
+        acolyte.id,
+        turnRequestSchema.parse({
+          ...acolyte.defaults,
+          input: [
+            { type: "text", text: `Opened by ${parent.name}`, mentions: [] },
+            {
+              type: "text",
+              text: brief,
+              visibility: "agent-only",
+              mentions: [],
+            },
+          ],
+        }),
+        { kind: "acolyte", log: opening },
+      ),
+    );
+  }
+
+  /**
+   * Puts a sage under a lead as its acolyte, or with null makes it its own
+   * lead again. Its chat stays its own; the leads' chats record the move.
+   */
+  async function moveSage(id: string, parentId: string | null): Promise<void> {
+    const sage = findSage(id);
+    if (sage.parentId === parentId) return;
+    if (parentId !== null) {
+      const lead = findSage(parentId);
+      if (lead.id === id) throw new Error("A sage cannot be its own acolyte");
+      if (lead.parentId !== null) {
+        throw new Error(`${lead.name} is itself an acolyte`);
+      }
+      if (sages.some((each) => each.parentId === id)) {
+        throw new Error(`${sage.name} has acolytes of its own`);
+      }
+    }
+    if (sage.parentId !== null) {
+      chatOf(sage.parentId).append("acolyte", acolyteHead(sage, "left"));
+    }
+    if (parentId !== null) {
+      chatOf(parentId).append(
+        "acolyte",
+        `${acolyteHead(sage, "joined")}\n\nFocus: ${sage.topic || "none given"}`,
+      );
+    }
+    await updateSage(id, { parentId, archivedAt: null, closing: false });
+    nudgeSidebar();
+  }
+
+  /** The acolyte's chat, written down for its main chat by the cheap model. */
+  async function acolyteSummary(acolyte: Sage): Promise<string> {
+    const chat = chatOf(acolyte.id);
+    let log = chat
+      .history(null, 100_000)
+      .map((message) => `${message.kind}: ${message.text}`)
+      .join("\n\n");
+    // A long acolyte is read as its view, as the sage would.
+    if (Buffer.byteLength(log) > 150_000) {
+      await chat.settled();
+      log = chat.render();
+    }
+    const summary = (
+      await runClaude(
+        ACOLYTE_SUMMARY_PROMPT,
+        `<acolyte>\n${log}\n</acolyte>\nName: ${acolyte.name}\nFocus: ${acolyte.topic || "none given"}`,
+        AbortSignal.timeout(300_000),
+      )
+    ).trim();
+    if (summary === "") throw new Error("The summary came back empty");
+    return summary;
+  }
+
+  async function archiveAcolyte(id: string): Promise<Sage> {
+    const { threadId } = findSage(id);
+    if (threadId !== null) bb.sdk.threads.archive({ threadId }).catch(() => {});
+    const archived = await updateSage(id, {
+      archivedAt: new Date().toISOString(),
+      closing: false,
+      running: false,
+    });
+    nudgeSidebar();
+    return archived;
+  }
+
+  async function closeAcolyte(id: string, summary: boolean): Promise<Sage> {
+    const acolyte = findSage(id);
+    if (acolyte.parentId === null)
+      throw new Error(`${acolyte.name} is not an acolyte`);
+    if (acolyte.archivedAt !== null || acolyte.closing) return acolyte;
+    const parentId = acolyte.parentId;
+    if (acolyte.running && acolyte.threadId !== null) {
+      await bb.sdk.threads.stop({ threadId: acolyte.threadId }).catch(() => {});
+    }
+    if (!summary) {
+      chatOf(parentId).append(
+        "acolyte",
+        `${acolyteHead(acolyte, "archived")}\n\nClosed without a summary.`,
+      );
+      return archiveAcolyte(id);
+    }
+    const closing = await updateSage(id, { closing: true, error: null });
+    // The summary takes a model call: the acolyte shows as closing meanwhile.
+    serial(id, async () => {
+      await drain(id).catch(() => {});
+      const text = `${acolyteHead(acolyte, "closed")}\n\n${await acolyteSummary(acolyte)}`;
+      await serial(parentId, async () => {
+        try {
+          await deliver(
+            parentId,
+            acolyte.threadId,
+            `Acolyte "${acolyte.name}" closed with a summary`,
+            text,
+            "acolyte",
+          );
+        } catch (cause) {
+          chatOf(parentId).append("acolyte", text);
+          bb.log.warn(
+            `could not deliver an acolyte summary: ${errorText(cause)}`,
+          );
+        }
+      });
+      await archiveAcolyte(id);
+    }).catch(async (cause) => {
+      bb.log.warn(`could not close an acolyte: ${errorText(cause)}`);
+      await updateSage(id, {
+        closing: false,
+        error: `Closing failed: ${errorText(cause)}`,
+      }).catch(() => {});
+    });
+    return closing;
+  }
+
+  async function reopenAcolyte(id: string): Promise<Sage> {
+    const acolyte = findSage(id);
+    if (acolyte.parentId === null || acolyte.archivedAt === null)
+      return acolyte;
+    chatOf(acolyte.parentId).append(
+      "acolyte",
+      acolyteHead(acolyte, "reopened"),
+    );
+    const reopened = await updateSage(id, { archivedAt: null });
+    nudgeSidebar();
+    return reopened;
   }
 
   // --- Specialists ---
@@ -586,7 +932,7 @@ export default async function plugin(bb: BbPluginApi) {
    * Reports sent into a running turn by their one-line notice, so its log
    * records the whole report as work.
    */
-  const reports = new Map<string, string[]>();
+  const reports = new Map<string, { kind: Kind; text: string }[]>();
 
   /**
    * Brings a specialist's report into the sage's chat: between the tool
@@ -594,9 +940,10 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function deliver(
     sageId: string,
-    workerId: string,
+    senderId: string | null,
     notice: string,
     report: string,
+    kind: Kind = "work",
   ): Promise<void> {
     // The user sees one line from the specialist's thread; the agent gets
     // the whole report, and so does the chat's log.
@@ -607,12 +954,15 @@ export default async function plugin(bb: BbPluginApi) {
     await drain(sageId);
     const sage = findSage(sageId);
     if (sage.running && sage.threadId !== null) {
-      reports.set(notice, [...(reports.get(notice) ?? []), report]);
+      reports.set(notice, [
+        ...(reports.get(notice) ?? []),
+        { kind, text: report },
+      ]);
       await bb.sdk.threads.send({
         threadId: sage.threadId,
         mode: "auto",
         input,
-        senderThreadId: workerId,
+        ...(senderId === null ? {} : { senderThreadId: senderId }),
       } as unknown as Parameters<typeof bb.sdk.threads.send>[0]);
       return;
     }
@@ -620,7 +970,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`${sage.name} has no turn to report to`);
     }
     await send(sageId, turnRequestSchema.parse({ ...sage.defaults, input }), {
-      kind: "work",
+      kind,
       log: report,
     });
   }
@@ -633,11 +983,18 @@ export default async function plugin(bb: BbPluginApi) {
     if (worker === undefined) return;
     workers.delete(threadId);
     saveWorkers().catch(() => {});
-    serial(worker.sageId, async () => {
+    // A report for a closed acolyte goes to its main chat instead.
+    let sage = sages.find((candidate) => candidate.id === worker.sageId);
+    if (sage?.archivedAt != null && sage.parentId !== null) {
+      sage = sages.find((candidate) => candidate.id === sage!.parentId);
+    }
+    if (sage === undefined) return;
+    const sageId = sage.id;
+    serial(sageId, async () => {
       const text = await report(worker.specialist);
       try {
         await deliver(
-          worker.sageId,
+          sageId,
           threadId,
           `${worker.specialist} ${outcome}`,
           text,
@@ -645,7 +1002,7 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (cause) {
         // Undelivered, the report still joins the chat, so the sage sees it
         // in the view at its next turn.
-        chatOf(worker.sageId).append("work", text);
+        chatOf(sageId).append("work", text);
         throw cause;
       }
     }).catch((cause) =>
@@ -713,6 +1070,12 @@ export default async function plugin(bb: BbPluginApi) {
   );
   // Catch up on what happened while the plugin was not loaded.
   for (const sage of sages) {
+    if (sage.closing) {
+      updateSage(sage.id, {
+        closing: false,
+        error: "Closing was interrupted; close it again",
+      }).catch(() => {});
+    }
     if (sage.threadId === null) continue;
     const { threadId } = sage;
     follow(threadId, async () => {
@@ -727,8 +1090,11 @@ export default async function plugin(bb: BbPluginApi) {
     sages_list: () => ({
       sages: sages.map((sage) => ({ ...sage, stats: chatOf(sage.id).stats() })),
     }),
-    sages_create: (input) => createSage(input),
-    sages_update: ({ id, ...patch }) => updateSage(id, patch),
+    sages_create: (input) => createUnder(input),
+    sages_update: async ({ id, parentId, ...patch }) => {
+      if (parentId !== undefined) await moveSage(id, parentId);
+      return updateSage(id, patch);
+    },
     sages_remove: async ({ id }) => ({ removed: await removeSage(id) }),
     sages_send: ({ id, request }) => serial(id, () => send(id, request)),
     sages_reorder: async ({ ids }) => {
@@ -749,19 +1115,38 @@ export default async function plugin(bb: BbPluginApi) {
       findSage(id);
       return { messages: chatOf(id).history(before, limit) };
     },
+    sages_open_acolyte: ({ id, name, focus }) =>
+      serial(id, () => openAcolyte(id, name, focus, null)),
+    sages_close_acolyte: ({ id, summary }) => closeAcolyte(id, summary),
+    sages_reopen_acolyte: ({ id }) => reopenAcolyte(id),
   });
 
   // --- The sage's agent: instructions and memory tools ---
 
-  /** The chat of the sage a thread belongs to, by the thread's metadata. */
-  async function chatOfThread(threadId: string): Promise<Chat> {
+  /** The sage a thread is a turn of, by the thread's metadata. */
+  async function sageOfTurn(threadId: string): Promise<Sage> {
     const { sageId } = (await bb.sdk.threads.getPluginMetadata({
       threadId,
     })) as { sageId?: unknown };
     if (typeof sageId !== "string") throw new Error("Not a sage's thread");
-    findSage(sageId);
-    return chatOf(sageId);
+    return findSage(sageId);
   }
+  /** The chat a turn reads: its own, or in an acolyte the main one. */
+  async function chatOfThread(
+    threadId: string,
+    which: "main" | undefined,
+  ): Promise<Chat> {
+    const sage = await sageOfTurn(threadId);
+    if (which === undefined) return chatOf(sage.id);
+    if (sage.parentId === null) {
+      throw new Error('This is the main chat: leave out "main"');
+    }
+    return chatOf(sage.parentId);
+  }
+  const chatParameter = z
+    .enum(["main"])
+    .optional()
+    .describe('In an acolyte, "main" reads the lead sage\'s view instead');
   const toolResult = async (work: () => Promise<string>) => {
     try {
       return await work();
@@ -787,16 +1172,20 @@ export default async function plugin(bb: BbPluginApi) {
         .int()
         .min(1)
         .describe("How many messages the line covers: a power of 2"),
+      chat: chatParameter,
     }),
-    execute: ({ id, n }, { threadId }) =>
-      toolResult(async () => (await chatOfThread(threadId)).zoom(id, n)),
+    execute: ({ id, n, chat }, { threadId }) =>
+      toolResult(async () => (await chatOfThread(threadId, chat)).zoom(id, n)),
   });
   bb.agents.registerTool({
     name: DATE_TOOL,
     description: "The date and time of message id.",
-    parameters: z.object({ id: z.number().int().min(0) }),
-    execute: ({ id }, { threadId }) =>
-      toolResult(async () => (await chatOfThread(threadId)).date(id)),
+    parameters: z.object({
+      id: z.number().int().min(0),
+      chat: chatParameter,
+    }),
+    execute: ({ id, chat }, { threadId }) =>
+      toolResult(async () => (await chatOfThread(threadId, chat)).date(id)),
   });
   bb.agents.registerTool({
     name: HANDOFF_TOOL,
@@ -822,11 +1211,8 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     execute: ({ specialist, task }, { threadId }) =>
       toolResult(async () => {
-        const { sageId } = (await bb.sdk.threads.getPluginMetadata({
-          threadId,
-        })) as { sageId?: unknown };
-        if (typeof sageId !== "string") throw new Error("Not a sage's thread");
-        const sage = findSage(sageId);
+        const sage = await sageOfTurn(threadId);
+        const sageId = sage.id;
         const turn = await bb.sdk.threads.get({ threadId });
         // No parent thread: bb would report the result to this turn's
         // thread, which a later message may have replaced. The report is
@@ -851,6 +1237,41 @@ export default async function plugin(bb: BbPluginApi) {
         ].join("\n");
       }),
   });
+  bb.agents.registerTool({
+    name: ACOLYTE_TOOL,
+    description:
+      "Open an acolyte: a sage under you, with your memory, focused on one part of your work. Only when the user asks for one.",
+    instructions: ACOLYTE_PROMPT,
+    presentation: {
+      label: { pending: "Opening acolyte", completed: "Opened acolyte" },
+    },
+    parameters: z.object({
+      name: nameInput.describe("A few words naming the acolyte"),
+      focus: topicInput.describe("One line on the part of your work it covers"),
+      brief: z
+        .string()
+        .trim()
+        .min(1)
+        .max(30_000)
+        .optional()
+        .describe(
+          "Its first message, which it works on at once: the goal, what to leave out, and what to bring back. Leave out to let the user start it",
+        ),
+    }),
+    execute: ({ name, focus, brief }, { threadId }) =>
+      toolResult(async () => {
+        const sage = await sageOfTurn(threadId);
+        const turn = await bb.sdk.threads.get({ threadId });
+        const acolyte = await openAcolyte(sage.id, name, focus, brief ?? null, {
+          projectId: turn.projectId,
+          environmentId: turn.environmentId ?? null,
+        });
+        return [
+          `Opened the acolyte "${acolyte.name}" (acolyte ${acolyte.id})${brief === undefined ? "" : "; it is working on the brief"}.`,
+          "The user reaches it from this chat. Leave its work to it; its summary may come back here if the user closes it.",
+        ].join("\n");
+      }),
+  });
   // A thread is a sage's turn when its metadata names a sage. The metadata
   // is writable by any client; all it unlocks is reading that sage's chat.
   bb.agents.configure((context) => {
@@ -859,7 +1280,10 @@ export default async function plugin(bb: BbPluginApi) {
     return sage === undefined
       ? { tools: [], skills: [] }
       : {
-          tools: [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL],
+          tools:
+            sage.parentId === null
+              ? [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL, ACOLYTE_TOOL]
+              : [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL],
           skills: [],
           instructions: sageInstructions(sage),
         };
@@ -876,7 +1300,8 @@ export default async function plugin(bb: BbPluginApi) {
     "Usage:",
     "  bb sages list [--json]",
     "  bb sages show <sage-id> [--json]",
-    "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--json]",
+    "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
+    "  bb sages lead <sage-id> <lead-sage-id|none> [--json]",
     "  bb sages remove <sage-id> [--json]",
   ].join("\n");
   function formatSage(sage: Sage): string {
@@ -897,7 +1322,13 @@ export default async function plugin(bb: BbPluginApi) {
         name: "create",
         summary: "Create a sage",
         usage:
-          "bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--json]",
+          "bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
+      },
+      {
+        name: "lead",
+        summary:
+          "Make a sage an acolyte of a lead sage, or with none, its own lead",
+        usage: "bb sages lead <sage-id> <lead-sage-id|none> [--json]",
       },
       {
         name: "remove",
@@ -915,7 +1346,8 @@ export default async function plugin(bb: BbPluginApi) {
         else if (
           arg === "--topic" ||
           arg === "--instructions" ||
-          arg === "--project"
+          arg === "--project" ||
+          arg === "--lead"
         ) {
           const value = argv[(index += 1)];
           if (value === undefined) return { exitCode: 1, stderr: usage };
@@ -934,13 +1366,23 @@ export default async function plugin(bb: BbPluginApi) {
           case "help":
           case "--help":
             return { exitCode: 0, stdout: usage };
-          case "list":
+          case "list": {
+            const open = sages.filter((sage) => sage.archivedAt === null);
             return reply(
-              sages,
-              sages.length === 0
+              open,
+              open.length === 0
                 ? "No sages."
-                : sages.map(formatSage).join("\n"),
+                : open
+                    .filter((sage) => sage.parentId === null)
+                    .flatMap((sage) => [
+                      formatSage(sage),
+                      ...open
+                        .filter((acolyte) => acolyte.parentId === sage.id)
+                        .map((acolyte) => `  ↳ ${formatSage(acolyte)}`),
+                    ])
+                    .join("\n"),
             );
+          }
           case "show": {
             if (sageId === undefined || rest.length !== 1) break;
             const sage = findSage(sageId);
@@ -950,6 +1392,9 @@ export default async function plugin(bb: BbPluginApi) {
               [
                 formatSage(sage),
                 sage.projectId === null ? null : `project: ${sage.projectId}`,
+                sage.parentId === null
+                  ? null
+                  : `acolyte of: ${findSage(sage.parentId).name} (${sage.parentId})`,
                 `chat: ${stats.messages} messages, view ${stats.viewBytes} bytes, ${stats.pending} to summarize${sage.running ? ", working" : ""}`,
                 sage.instructions === "" ? null : `\n${sage.instructions}`,
               ]
@@ -962,6 +1407,7 @@ export default async function plugin(bb: BbPluginApi) {
               name: rest.join(" "),
               topic: flags.topic,
               projectId: flags.project ?? null,
+              parentId: flags.lead ?? null,
               instructions: flags.instructions,
             });
             if (!input.success) {
@@ -980,8 +1426,21 @@ export default async function plugin(bb: BbPluginApi) {
                 };
               }
             }
-            const sage = await createSage(input.data);
+            const sage = await createUnder(input.data);
             return reply(sage, `Created ${formatSage(sage)}`);
+          }
+          case "lead": {
+            const [, lead] = rest;
+            if (sageId === undefined || lead === undefined || rest.length !== 2)
+              break;
+            await moveSage(sageId, lead === "none" ? null : lead);
+            const sage = findSage(sageId);
+            return reply(
+              sage,
+              lead === "none"
+                ? `${sage.name} is its own lead`
+                : `${sage.name} is now an acolyte of ${findSage(lead).name}`,
+            );
           }
           case "remove": {
             if (sageId === undefined || rest.length !== 1) break;
