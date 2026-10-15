@@ -257,7 +257,7 @@ function SageList() {
                       navigate.toPluginPanel(PANEL_PATH, { subPath: sage.id })
                     }
                   >
-                    <Icon name="Sparkles" className="size-4 shrink-0" />
+                    <Icon name="sages/sage" className="size-4 shrink-0" />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium">
                         {sage.name}
@@ -1075,7 +1075,7 @@ function SageChat({ sageId }: { sageId: string }) {
           aria-label="Edit sage"
           onClick={() => setEditing((current) => !current)}
         >
-          <Icon name="Pencil" className="size-4" />
+          <Icon name="Edit" className="size-4" />
         </Button>
         <Button
           variant="ghost"
@@ -1362,7 +1362,7 @@ function SageDevServices({ subPath }: PluginNavPanelProps) {
           size="icon"
           variant="ghost"
         >
-          <Icon name="RefreshCw" className="size-4" />
+          <Icon name="ArrowReloadHorizontal" className="size-4" />
         </Button>
       </div>
       {error === null ? null : (
@@ -1461,7 +1461,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "sages",
     title: "Sages",
-    icon: "Sparkles",
+    icon: "sages/sage",
     path: PANEL_PATH,
     component: SagesPage,
     fixedTabs: [
@@ -1469,7 +1469,7 @@ export default definePluginApp((app) => {
         panelId: "sages",
         id: "dev-services",
         title: "Dev services",
-        icon: "Server",
+        icon: "ComputerTerminal01",
         component: SageDevServices,
       },
     ],
