@@ -793,58 +793,131 @@ function Transcript({
   );
 }
 
-/**
- * The id of the running turn's thread once it has loaded. bb's ThreadChat
- * shows only skeletons until its thread loads, so the page keeps showing the
- * logged chat until then and mounts the live chat out of sight meanwhile.
- */
-function useLoadedThread(threadId: string | null): string | null {
-  const sdk = useSdk();
-  const [loaded, setLoaded] = useState<string | null>(null);
-  useEffect(() => {
-    if (threadId === null) return;
-    let stale = false;
-    const done = () => {
-      // A beat for ThreadChat's own fetch of the same data to land.
-      setTimeout(() => {
-        if (!stale) setLoaded(threadId);
-      }, 250);
-    };
-    Promise.all([
-      sdk.threads.get({ threadId }),
-      sdk.threads.timeline({ threadId }),
-    ]).then(done, done);
-    return () => {
-      stale = true;
-    };
-  }, [sdk, threadId]);
-  return loaded === threadId ? loaded : null;
+/** bb's ThreadChat draws these bars until its thread's timeline has loaded. */
+const SKELETON = ".animate-pulse.bg-surface-selected";
+/** Marks the logged chat inside a ThreadChat, apart from the turn's own. */
+const LEADING = "data-sage-transcript";
+
+/** A turn's thread on the page, and the first message of the chat it shows. */
+interface Turn {
+  threadId: string;
+  turnStart: number | null;
 }
 
-/** A scroll area that stays at its end as `watch` changes. */
+/**
+ * A turn's thread, as bb's ThreadChat shows it, after the logged chat before
+ * it. Mounted out of sight first: it reports ready once bb has drawn the
+ * turn itself and no skeleton is left, so it is never shown half loaded.
+ */
+function TurnView({
+  turn,
+  visible,
+  leading,
+  onReady,
+}: {
+  turn: Turn;
+  visible: boolean;
+  leading: ReactNode;
+  onReady: () => void;
+}) {
+  const area = useRef<HTMLDivElement>(null);
+  const ready = useRef(onReady);
+  ready.current = onReady;
+  useEffect(() => {
+    const root = area.current;
+    if (visible || root === null) return;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      // One frame for the layout to settle before it is shown.
+      requestAnimationFrame(() => ready.current());
+    };
+    const check = () => {
+      if (root.querySelector(SKELETON) !== null) return;
+      const leadingText =
+        root.querySelector(`[${LEADING}]`)?.textContent?.length ?? 0;
+      // The turn's own messages are drawn: text beyond the logged chat.
+      if ((root.textContent?.length ?? 0) > leadingText) finish();
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(root, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+    });
+    // However the load goes, the turn shows in the end.
+    const timer = setTimeout(finish, 8000);
+    check();
+    return () => {
+      done = true;
+      observer.disconnect();
+      clearTimeout(timer);
+    };
+  }, [visible]);
+  return (
+    <ScrollToEnd
+      areaRef={area}
+      watch={visible}
+      className={
+        visible
+          ? "min-h-0 flex-1 overflow-y-auto"
+          : "invisible absolute inset-0 overflow-y-auto"
+      }
+    >
+      <div className={CHAT_COLUMN}>
+        <ThreadChat
+          threadId={turn.threadId}
+          // Transcript only: the page's one composer stays put.
+          variant="timeline"
+          layout="document"
+          leadingContent={<div {...{ [LEADING]: "" }}>{leading}</div>}
+        />
+      </div>
+    </ScrollToEnd>
+  );
+}
+
+/**
+ * A scroll area that stays at its end while the reader is there, as content
+ * loads, streams in or animates open, and when `watch` changes.
+ */
 function ScrollToEnd({
   watch,
   className,
+  areaRef,
   children,
 }: {
   watch: unknown;
   className: string;
+  areaRef?: React.RefObject<HTMLDivElement | null>;
   children: ReactNode;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const own = useRef<HTMLDivElement>(null);
+  const ref = areaRef ?? own;
   const atEnd = useRef(true);
   useLayoutEffect(() => {
     const area = ref.current;
-    if (area === null) return;
-    // Content arrives after the fetch; follow it while the reader is at the end.
-    const observer = new ResizeObserver(() => {
-      if (atEnd.current) area.scrollTop = area.scrollHeight;
-    });
-    if (area.firstElementChild !== null)
-      observer.observe(area.firstElementChild);
-    area.scrollTop = area.scrollHeight;
-    return () => observer.disconnect();
-  }, [watch]);
+    if (area !== null) area.scrollTop = area.scrollHeight;
+  }, [ref, watch]);
+  useEffect(() => {
+    // Checked every frame: bb's timeline grows in ways a ResizeObserver on
+    // this area's content does not always see.
+    let frame = 0;
+    let height = -1;
+    const follow = () => {
+      const area = ref.current;
+      if (area !== null && area.scrollHeight !== height) {
+        height = area.scrollHeight;
+        if (atEnd.current) area.scrollTop = height;
+      }
+      frame = requestAnimationFrame(follow);
+    };
+    frame = requestAnimationFrame(follow);
+    return () => cancelAnimationFrame(frame);
+  }, [ref]);
   return (
     <div
       ref={ref}
@@ -862,7 +935,6 @@ function ScrollToEnd({
 
 function SageChat({ sageId }: { sageId: string }) {
   const { rpc, sages, error, report } = useSages();
-  const projects = useProjects();
   const navigate = useBbNavigate();
   const [editing, setEditing] = useState(false);
   const [branching, setBranching] = useState(false);
@@ -878,8 +950,15 @@ function SageChat({ sageId }: { sageId: string }) {
       ? navigate.toPluginPanel(PANEL_PATH)
       : toSage(navigate, sage.parentId);
   const history = useHistory(sageId, sage?.stats.messages ?? 0);
-  const liveThread = sage?.running === true ? (sage.threadId ?? null) : null;
-  const loadedThread = useLoadedThread(liveThread);
+  // The turn on screen, kept after it ends: swapping back to the logged chat
+  // would reflow the page for nothing. A new turn replaces it once loaded.
+  const [shown, setShown] = useState<Turn | null>(null);
+  const pending: Turn | null =
+    sage?.running === true &&
+    sage.threadId !== null &&
+    sage.threadId !== shown?.threadId
+      ? { threadId: sage.threadId, turnStart: sage.turnStart }
+      : null;
 
   if (sages === null) {
     return (
@@ -929,13 +1008,13 @@ function SageChat({ sageId }: { sageId: string }) {
     }
     rpc.call("sages_remove", { id: sage.id }).then(toList, report);
   };
-  const transcript = (live: boolean) => (
+  /** The logged chat; before a turn, up to where the turn's thread starts. */
+  const transcript = (turn: Turn | null) => (
     <Transcript
-      // While the live thread shows, it shows the running turn's messages.
       messages={
-        live && sage.turnStart !== null
-          ? history.messages.filter((message) => message.i < sage.turnStart!)
-          : history.messages
+        turn?.turnStart == null
+          ? history.messages
+          : history.messages.filter((message) => message.i < turn.turnStart!)
       }
       more={history.more}
       onLoadEarlier={history.loadEarlier}
@@ -949,22 +1028,24 @@ function SageChat({ sageId }: { sageId: string }) {
       <header className="flex shrink-0 items-center gap-2 border-b border-border py-2 pl-4 pr-3">
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{sage.name}</div>
-          <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-            {isAcolyte ? (
-              <Icon name="GitBranch" className="size-3 shrink-0" />
-            ) : null}
-            <span className="truncate">
-              {[
-                isAcolyte
-                  ? `Acolyte of ${parent?.name ?? "a sage"}`
-                  : subtitle(sage, projects),
-                memoryLine(sage),
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            </span>
-          </div>
         </div>
+        {sage.running ? (
+          // In the header, so the chat never shifts as turns start and end.
+          <Button
+            variant="ghost"
+            className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"
+            aria-label={`Stop ${sage.name}`}
+            onClick={() => {
+              rpc.call("sages_stop", { id: sage.id }).catch(report);
+            }}
+          >
+            <span
+              aria-hidden="true"
+              className="size-1.5 animate-pulse rounded-full bg-amber-500"
+            />
+            Stop
+          </Button>
+        ) : null}
         {isAcolyte && sage.archivedAt === null && !sage.closing ? (
           <Button
             variant="ghost"
@@ -1062,36 +1143,29 @@ function SageChat({ sageId }: { sageId: string }) {
         </div>
       ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">
-          {liveThread === null ? null : (
-            // Mounted out of sight until it has loaded, then shown in place,
-            // so it never remounts and never flashes skeletons.
-            <ScrollToEnd
-              watch={loadedThread}
-              className={
-                loadedThread === null
-                  ? "invisible absolute inset-0 overflow-y-auto"
-                  : "min-h-0 flex-1 overflow-y-auto"
-              }
-            >
-              <div className={CHAT_COLUMN}>
-                <ThreadChat
-                  key={liveThread}
-                  threadId={liveThread}
-                  // Transcript only: the page's one composer stays put.
-                  variant="timeline"
-                  layout="document"
-                  leadingContent={transcript(true)}
-                />
-              </div>
-            </ScrollToEnd>
-          )}
-          {loadedThread !== null ? null : (
+          {shown === null ? (
             <ScrollToEnd
               watch={sage.stats.messages}
               className="min-h-0 flex-1 overflow-y-auto"
             >
-              <div className={CHAT_COLUMN}>{transcript(false)}</div>
+              <div className={CHAT_COLUMN}>
+                {/* ThreadChat's own padding, so nothing shifts when it
+                    takes over. */}
+                <div className="px-2 pb-3 pt-3">{transcript(null)}</div>
+              </div>
             </ScrollToEnd>
+          ) : null}
+          {[shown, pending].map((turn) =>
+            turn === null ? null : (
+              <TurnView
+                // Keyed by thread, so the loaded view is shown in place.
+                key={turn.threadId}
+                turn={turn}
+                visible={turn === shown}
+                leading={transcript(turn)}
+                onReady={() => setShown(turn)}
+              />
+            ),
           )}
         </div>
       )}
@@ -1115,27 +1189,7 @@ function SageChat({ sageId }: { sageId: string }) {
           </p>
         )}
         <OpenAcolytes acolytes={openAcolytes} />
-        {sage.running ? (
-          <div className="flex items-center justify-between pb-1.5 pl-1 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5">
-              <span
-                aria-hidden="true"
-                className="size-1.5 animate-pulse rounded-full bg-amber-500"
-              />
-              Working
-            </span>
-            <Button
-              variant="ghost"
-              className="h-7 px-2 text-xs"
-              onClick={() => {
-                rpc.call("sages_stop", { id: sage.id }).catch(report);
-              }}
-            >
-              <Icon name="Square" className="size-3.5" />
-              Stop
-            </Button>
-          </div>
-        ) : null}
+
         {sage.archivedAt !== null || sage.closing ? null : (
           // Its own box: the composer fills its parent's height, so lines
           // above it in a shared box would push its controls out of sight.
@@ -1396,7 +1450,11 @@ function SageDevServices({ subPath }: PluginNavPanelProps) {
 
 function SagesPage({ subPath }: PluginNavPanelProps) {
   const sageId = subPath.split("/")[0] ?? "";
-  return sageId === "" ? <SageList /> : <SageChat sageId={sageId} />;
+  return sageId === "" ? (
+    <SageList />
+  ) : (
+    <SageChat key={sageId} sageId={sageId} />
+  );
 }
 
 export default definePluginApp((app) => {
