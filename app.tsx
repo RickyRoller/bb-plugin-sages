@@ -32,6 +32,7 @@ import type { ListedSage as Sage, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { EnvoyList, registerEnvoyApp } from "./envoys-app";
 
 const PANEL_PATH = "sages";
 
@@ -1396,10 +1397,19 @@ function SageDevServices({ subPath }: PluginNavPanelProps) {
 
 function SagesPage({ subPath }: PluginNavPanelProps) {
   const sageId = subPath.split("/")[0] ?? "";
-  return sageId === "" ? <SageList /> : <SageChat sageId={sageId} />;
+  const navigate = useBbNavigate();
+  if (sageId !== "" && sageId !== "envoys") return <SageChat sageId={sageId} />;
+  return <div className="flex h-full min-h-0 flex-col">
+    <div className="flex gap-2 border-b border-border px-4 py-2" role="tablist" aria-label="Workstreams">
+      <Button role="tab" aria-selected={sageId === ""} variant={sageId === "" ? "secondary" : "ghost"} onClick={() => navigate.toPluginPanel(PANEL_PATH)}>Sages</Button>
+      <Button role="tab" aria-selected={sageId === "envoys"} variant={sageId === "envoys" ? "secondary" : "ghost"} onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: "envoys" })}>Envoys</Button>
+    </div>
+    {sageId === "envoys" ? <EnvoyList /> : <SageList />}
+  </div>;
 }
 
 export default definePluginApp((app) => {
+  registerEnvoyApp(app);
   app.slots.navPanel({
     id: "sages",
     title: "Sages",

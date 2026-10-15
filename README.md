@@ -17,7 +17,72 @@ instructions, and one chat that never ends.
 - `skills/sages/SKILL.md` — tells agents how to use `bb sages`.
 - `PLUGIN_OVERVIEW.md` — the store listing text.
 
-Run `npm test` for the engine's tests and `npm run typecheck` for types.
+Run `npm test` for engine, Envoy lifecycle and frontend interaction tests and `npm run typecheck` for types.
+
+## Envoys
+
+An Envoy is a task with one stable, visible BB thread and a dedicated workspace.
+Open **Sages → Envoys → New Envoy**, or use the **New Envoy** command palette action.
+Describe the task; the name is optional and defaults to the first line of the directive.
+A full Linear issue URL is optional and appears in the chat header and Sidebar Thread
+Details row. Git projects default to a fresh BB worktree, including local repositories
+without a remote. BB's composer controls the machine, base branch, model and permissions.
+The details dialog shows project, workspace, branch and execution settings.
+
+An ordinary BB agent leads by default. An optional specialist lead supplies execution defaults at launch;
+changing the lead never resets the composer. Explicit execution selections take precedence. Each startup lists available specialists
+and directs the Envoy to delegate appropriate work. Sages and Acolytes have no automatic
+Envoy delegation or Send Envoy control: creating one from those chats requires the user's
+explicit instruction.
+
+PRs must be opened as drafts and attached with `envoy_attach_pr` or the details dialog.
+Only Envoys with attached PRs allocate a polling timer or make GitHub requests. Readiness
+is checked once per minute on the workspace's machine through authenticated `gh`; the
+plugin never discovers PRs by branch and never marks them ready. Once the user marks a
+PR ready (or explicitly asks the Envoy to), the plugin starts the mandatory `pr-handoff`
+specialist for the existing required-CI and six-hour review-reminder procedure. Its worker
+is parented to the Envoy and recovered by a persisted key across reloads or interrupted
+responses. Readiness polling stops after handoff, detachment, closure or merge. Missing
+specialists and GitHub failures appear in task details with a retry action.
+Read-only readiness failures retry automatically with a capped backoff; handoff
+errors pause until Retry. Sages requires Specialists' keyed handoff
+protocol v1 and verifies worker metadata, so an older plugin cannot silently
+launch an unkeyed monitor.
+
+An unconfirmed handoff only searches for its original worker. **Relaunch handoff**
+requires explicit confirmation, searches again, and permits a new attempt only
+when no worker is found. An earlier delayed request may still create a duplicate,
+so use this only after ordinary recovery fails.
+
+Park stops implementation threads while preserving the visible chat, workspace, attached
+PR watcher and registered handoff workers. Resume continues the directive; complete stores
+the task's final output. Complete keeps attached PR follow-up. Cancel stops readiness watchers and
+handoff agents as well as implementation; resume the task before restarting PR
+follow-up. Automated notices cannot resume parked, completed or cancelled tasks.
+A user message resumes parked or completed tasks. Cancelled tasks require Resume.
+After resuming a cancelled task, open its pr-handoff thread to resume a stopped worker.
+Already-scheduled review reminders are independent Automations and can be managed
+there. These actions do not delete the workspace; cleanup remains a separate native BB action.
+
+```sh
+bb sages envoy create --project <id> --task 'Fix saved-swap crash' --issue https://linear.app/wallet/issue/WAL-123
+bb sages envoy list --json
+bb sages envoy show <id>
+bb sages envoy park <id>
+bb sages envoy resume <id>
+bb sages envoy pr <id> https://github.com/owner/repo/pull/123
+bb sages envoy complete <id>
+bb sages envoy cancel <id>
+bb sages envoy recover <id>
+```
+
+Creation is deduplicated by `--request-id` (the dialog generates one). Recovery adopts
+an existing thread through its metadata. Definite BB validation/rejection responses mark a launch failed; relaunch checks
+for an existing thread first, and the creation dialog retains the draft so you can
+correct selections and resubmit the same task. An ambiguous spawn outcome is never
+resent; `recover` searches again rather than risking duplicate agents. Unthreaded
+tasks can be cancelled, including uncertain launches. Once a thread exists,
+retry agent or provisioning failures through that native BB thread.
 
 ## How a sage's chat works
 
@@ -141,7 +206,7 @@ git installs) so people installing your plugin never need npm.
   `.webp` files.
 - `engines.bb` — supported bb app version range.
 - `engines.bbPluginSdk` — the lowest plugin SDK you need (scaffold:
-  `>=0.6.15`). BB reads this as a floor, not a ceiling: a later
+  `>=0.6.37`). BB reads this as a floor, not a ceiling: a later
   SDK in the same major still loads your plugin.
 - `dependencies` — every package your source imports that BB does not provide.
   `bb plugin build` inlines them into `dist/`, and git installs resolve this
@@ -201,7 +266,7 @@ bb plugin reload sages
 ## Types & API reference
 
 The plugin API ships as the npm package `@get-bb/plugin-sdk`, pinned to an
-exact version in `devDependencies` (`0.6.15` — the SDK of the BB
+exact version in `devDependencies` (`0.6.37` — the SDK of the BB
 that scaffolded this plugin). After `npm install`, the full surface is on disk
 at:
 

@@ -13,6 +13,7 @@ import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
+import { registerEnvoys } from "./envoys.ts";
 import {
   COMPACTION_PROMPT,
   HANDOFF_PROMPT,
@@ -292,6 +293,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
+  const envoys = await registerEnvoys(bb);
 
   // bb.agents.configure is synchronous, so sages are served from memory and
   // written through to storage.
@@ -1278,7 +1280,7 @@ export default async function plugin(bb: BbPluginApi) {
     const { sageId } = context.pluginMetadata;
     const sage = sages.find((candidate) => candidate.id === sageId);
     return sage === undefined
-      ? { tools: [], skills: [] }
+      ? envoys.configure(context)
       : {
           tools:
             sage.parentId === null
@@ -1303,6 +1305,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
     "  bb sages lead <sage-id> <lead-sage-id|none> [--json]",
     "  bb sages remove <sage-id> [--json]",
+    "  bb sages envoy list|show|create|recover|park|resume|complete|cancel|pr [--json]",
   ].join("\n");
   function formatSage(sage: Sage): string {
     const topic = sage.topic === "" ? "" : `  — ${sage.topic}`;
@@ -1312,6 +1315,7 @@ export default async function plugin(bb: BbPluginApi) {
     name: "sages",
     summary: "Manage sages: tuned chats bound to a topic or project",
     commands: [
+      { name: "envoy", summary: "Create and manage task workspaces (Envoys)", usage: "bb sages envoy list|show|create|recover|park|resume|complete|cancel|pr [--json]" },
       { name: "list", summary: "List sages", usage: "bb sages list [--json]" },
       {
         name: "show",
@@ -1336,7 +1340,8 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb sages remove <sage-id> [--json]",
       },
     ],
-    async run(argv) {
+    async run(argv, ctx) {
+      if (argv[0] === "envoy") return envoys.runCli(argv.slice(1), ctx);
       const flags: Record<string, string> = {};
       const args: string[] = [];
       let json = false;
