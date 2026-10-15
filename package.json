@@ -10,7 +10,10 @@
     "name": "Sages",
     "description": "Sages for lasting chats, Acolytes for focused child chats, and Envoys for task workspaces.",
     "branding": {
-      "icon": "Sparkles"
+      "icon": "./icons/sage.svg",
+      "experimental_icons": {
+        "sage": "./icons/sage.svg"
+      }
     },
     "server": "./server.ts",
     "app": "./app.tsx",
