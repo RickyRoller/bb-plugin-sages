@@ -1,6 +1,6 @@
 ---
 name: sages
-description: List, inspect, create, and remove sages (tuned chats bound to a topic or project) with the `bb sages` CLI. Use when the user asks about their sages, wants a new sage, or refers to a sage by name.
+description: List, inspect, create, and remove sages (tuned chats bound to a topic or project) with the `bb sages` CLI. Use when the user asks about their sages, wants a new sage or task-focused Envoy, or refers to a sage or Envoy by name.
 ---
 
 # Sages
@@ -34,3 +34,44 @@ Add `--json` to any command when the output drives code.
   out. Removing a lead removes its acolytes too.
 - Remove a sage only when the user asks for that sage by name: removal deletes
   its chat for good.
+
+
+## Envoys
+
+Envoys are standalone task workspaces, each with one stable visible BB thread.
+Create one only when the user asks for an Envoy or explicitly chooses that workflow.
+Sages and Acolytes already delegate to specialists; do not automatically replace that
+with Envoy creation.
+
+- `bb sages envoy list [--json]` and `show <id>` inspect tasks. Use returned ids.
+- `bb sages envoy create --project <project-id> --task <directive>` starts work in
+  a fresh worktree. Optional: `--name`, `--issue` (full Linear issue URL),
+  `--specialist` (lead preset), `--request-id` (reuse for deduplication).
+  Prefer the New Envoy UI when machine/model/permissions need selection.
+- `bb sages envoy park|resume|complete|cancel <id>` manages task lifecycle. Park
+  preserves workspace/chat and PR follow-up. Complete preserves PR follow-up;
+  cancel stops attached readiness checks and handoff agents. Already-scheduled
+  reminders are managed separately in Automations. These commands do not delete files.
+- `bb sages envoy pr <id> <full-github-pr-url>` attaches an existing task PR.
+  The primary Envoy agent can instead call `envoy_attach_pr` immediately after
+  opening its draft PR. The details dialog can detach or retry the handoff.
+- `bb sages envoy recover <id>` finds an existing thread after an interrupted
+  creation response; it does not resend ambiguous spawns. A definite rejected
+  launch can be relaunched; an unthreaded task can also be cancelled. Retry known agent or
+  workspace failures in the native task thread.
+
+Use specialists for appropriate work; a specialist lead is optional. All new PRs
+must open as drafts. Never mark ready without the user's explicit request. Only
+attached Envoy PRs are polled; readiness automatically starts the mandatory
+`pr-handoff` specialist. Do not start another handoff worker manually. If that
+specialist is unavailable, report the error and restore/retry it. Read-only host failures retry with backoff; handoff
+errors pause polling until Retry. Specialists must support keyed handoff version 1;
+older versions are rejected before dispatch. `gh` must be
+installed and authenticated on the task workspace's machine.
+
+Automated notices cannot resume parked/completed tasks; a user message resumes
+those tasks. Cancelled tasks require Resume. Resume a cancelled handoff worker
+from its own BB thread. Read-only readiness errors retry with backoff; handoff
+errors pause until Retry. For an unconfirmed handoff, ordinary Retry only
+recovers its original worker. The Envoy details UI offers a confirmed Relaunch
+handoff that searches again before permitting another spawn.

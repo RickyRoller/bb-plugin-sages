@@ -23,6 +23,11 @@
   },
   "include": [
     "server.ts",
+    "envoys.ts",
+    "envoy-contract.ts",
+    "envoys-app.tsx",
+    "envoys.test.ts",
+    "host.ts",
     "optchat.ts",
     "optchat.test.ts",
     "prompts.ts",
