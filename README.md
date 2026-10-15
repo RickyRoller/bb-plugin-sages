@@ -292,3 +292,8 @@ the whole surface with examples.
 
 Confused by the API, or need something the types don't explain? Clone the BB
 repo and read the source: <https://github.com/get-bb/bb>.
+
+## Icon
+
+`icons/sage.svg` is 賢 ("wise"), outlined from Noto Serif JP Medium
+(© Google, SIL Open Font License 1.1).

@@ -1279,8 +1279,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure((context) => {
     const { sageId } = context.pluginMetadata;
     const sage = sages.find((candidate) => candidate.id === sageId);
+    // Ordinary threads get the CLI skill so "create a sage/acolyte" finds it;
+    // sage turns use their own tools instead.
     return sage === undefined
-      ? envoys.configure(context)
+      ? { ...envoys.configure(context), skills: ["sages"] }
       : {
           tools:
             sage.parentId === null
