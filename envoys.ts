@@ -564,8 +564,18 @@ export async function registerEnvoys(
         );
       if (state === "active") {
         const thread = await bb.sdk.threads.get({ threadId: envoy.threadId });
-        if (thread.archivedAt !== null)
+        if (thread.archivedAt !== null) {
+          // A completed Envoy was archived: bring back its thread and, when
+          // the provider can, the worktree it held.
           await bb.sdk.threads.unarchive({ threadId: envoy.threadId });
+          const restored = await bb.sdk.threads.get({ threadId: envoy.threadId });
+          if (restored.canRestoreEnvironment)
+            await bb.sdk.threads
+              .restoreEnvironment({ threadId: envoy.threadId })
+              .catch((error) =>
+                bb.log.warn(`could not restore the workspace: ${errorText(error)}`),
+              );
+        }
         update(id, { lifecycle: "active" });
         try {
           await bb.sdk.threads.send({
@@ -583,22 +593,29 @@ export async function registerEnvoys(
           update(id, { lifecycle: envoy.lifecycle });
           throw error;
         }
-        if (envoy.lifecycle === "parked") await rewatch(get(id));
-      } else {
+        if (envoy.lifecycle === "parked" || envoy.lifecycle === "completed")
+          await rewatch(get(id));
+      } else if (state === "parked") {
         update(id, { lifecycle: state });
         await stopImplementation(envoy);
-        // A parked Envoy leaves nothing running; a completed one keeps
-        // watching so it can still hand off its PR.
-        if (state === "parked")
-          await unwatch(envoy).catch((error) =>
-            bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
-          );
+        await unwatch(envoy).catch((error) =>
+          bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
+        );
+      } else {
+        // Completing closes the Envoy out: its output is kept, then its
+        // thread is archived with its children and its worktree retired.
+        // The chat stays readable, and Resume brings it all back.
+        const { output } = await bb.sdk.threads.output({
+          threadId: envoy.threadId,
+        });
+        update(id, { lifecycle: state, result: output });
+        await unwatch(envoy).catch((error) =>
+          bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
+        );
+        await bb.sdk.threads.archive({ threadId: envoy.threadId });
+        return get(id);
       }
-      const result =
-        state === "completed"
-          ? (await bb.sdk.threads.output({ threadId: envoy.threadId })).output
-          : envoy.result;
-      return update(id, { lifecycle: state, result });
+      return update(id, { lifecycle: state });
     });
   }
   // --- PR watchers ---
@@ -699,7 +716,9 @@ export async function registerEnvoys(
       const next = attached
         ? envoy
         : update(id, { prs: [...envoy.prs, identity] });
-      if (next.lifecycle !== "parked") await watch(next, identity.url);
+      // Only a working Envoy is watched; resuming one watches its PRs again.
+      if (next.lifecycle === "active" || next.lifecycle === "creating")
+        await watch(next, identity.url);
       return next;
     });
   }
@@ -765,7 +784,7 @@ export async function registerEnvoys(
       const pr = updated.prs.find((p) => p.url === githubPr(url).url)!;
       const { handoffSpecialist } = await read();
       const watched = (await watchers(updated, pr.url)).length > 0;
-      return `Attached ${pr.url}. ${watched ? `A watcher automation you own checks it every 2 minutes: once you or the user marks it ready, you get a message starting "${READY_MARKER}" telling you to hand it off to ${handoffSpecialist}.` : handoffSpecialist ? "It is not watched while this Envoy is parked." : "No ready-PR handoff specialist is configured, so it is not watched."}`;
+      return `Attached ${pr.url}. ${watched ? `A watcher automation you own checks it every 2 minutes: once you or the user marks it ready, you get a message starting "${READY_MARKER}" telling you to hand it off to ${handoffSpecialist}.` : handoffSpecialist ? "It is not watched until this Envoy is resumed." : "No ready-PR handoff specialist is configured, so it is not watched."}`;
     },
   });
   bb.agents.registerTool({
@@ -838,16 +857,9 @@ export async function registerEnvoys(
       envoy.lifecycle === "creating"
     )
       return { action: "proceed" };
-    // A completed Envoy still hands off its own PR when its watcher says so.
-    if (
-      envoy.lifecycle === "completed" &&
-      context.input.text.trimStart().startsWith(READY_MARKER)
-    )
-      return { action: "proceed" };
     if (envoy.lifecycle !== "cancelled" && context.initiator === "user") {
-      const wasParked = envoy.lifecycle === "parked";
       const resumed = update(envoy.id, { lifecycle: "active" });
-      if (wasParked) void rewatch(resumed);
+      void rewatch(resumed);
       return { action: "proceed" };
     }
     return {

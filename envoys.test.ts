@@ -119,7 +119,19 @@ async function setup(
           })),
         }),
         stop: async () => ({ ok: true }),
-        unarchive: async () => ({ ok: true }),
+        archive: async ({ threadId }: { threadId: string }) => {
+          const thread = threads.get(threadId);
+          if (thread)
+            threads.set(threadId, { ...thread, archivedAt: Date.now() });
+          return {};
+        },
+        unarchive: async ({ threadId }: { threadId: string }) => {
+          const thread = threads.get(threadId);
+          if (thread)
+            threads.set(threadId, { ...thread, archivedAt: null, canRestoreEnvironment: true });
+          return { ok: true };
+        },
+        restoreEnvironment: async () => ({}),
         update: async () => ({}),
         send: async () => ({}),
         output: async () => ({ output: "Fixed and verified" }),
@@ -434,7 +446,7 @@ test("definite rejection retries the same task with corrected selections; uncert
   }
 });
 
-test("parking and cancelling remove watchers, resuming restores them, completing keeps them", async () => {
+test("parking, completing and cancelling remove watchers; resuming restores them", async () => {
   const s = await setup();
   try {
     const envoy = await s.create();
@@ -452,10 +464,36 @@ test("parking and cancelling remove watchers, resuming restores them, completing
     assert.equal(s.automations.length, 0);
     await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "active" });
     assert.equal(s.automations.length, 2);
-    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" });
-    assert.equal(s.automations.length, 2);
     await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "cancelled" });
     assert.equal(s.automations.length, 0);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("completing saves the output and archives the thread; resuming unarchives, restores and watches again", async () => {
+  const s = await setup();
+  try {
+    const envoy = await s.create();
+    const url = "https://github.com/owner/repo/pull/123";
+    await s.harness.behavior.callRpc("envoys_pr", { id: envoy.id, url, action: "attach" });
+    const done = (await s.harness.behavior.callRpc("envoys_lifecycle", {
+      id: envoy.id,
+      lifecycle: "completed",
+    })) as any;
+    assert.equal(done.lifecycle, "completed");
+    assert.equal(done.result, "Fixed and verified");
+    assert.equal(s.automations.length, 0);
+    const archived = s.harness.inspection.sdk.callsTo("threads.archive").map((c) => (c[0] as any).threadId);
+    assert.deepEqual(archived, [envoy.threadId]);
+    // A completed Envoy is not watched again on attach.
+    await s.harness.behavior.callRpc("envoys_pr", { id: envoy.id, url, action: "attach" });
+    assert.equal(s.automations.length, 0);
+    // Resuming brings the archived thread and its workspace back.
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "active" });
+    assert.equal(s.harness.inspection.sdk.callsTo("threads.unarchive").length, 1);
+    assert.equal(s.harness.inspection.sdk.callsTo("threads.restoreEnvironment").length, 1);
+    assert.equal(s.automations.length, 1);
   } finally {
     await s.harness.lifecycle.dispose();
   }
@@ -487,7 +525,7 @@ test("an archived Envoy thread loses its watchers, and other automations are lef
   }
 });
 
-test("a parked Envoy refuses automated messages, but a completed one takes its watcher's notice", async () => {
+test("parked and completed Envoys refuse automated messages; a user message resumes them", async () => {
   const s = await setup();
   try {
     const envoy = await s.create();
@@ -500,14 +538,13 @@ test("a parked Envoy refuses automated messages, but a completed one takes its w
           input: { text, blocks: [{ type: "text", text, mentions: [] }] },
         } as any),
       );
-    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" });
-    assert.equal((await send("[PR ready] https://github.com/owner/repo/pull/123 is marked ready", "system")).action, "proceed");
-    assert.equal((await send("Some other notice", "system")).action, "reject");
-    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "parked" });
-    assert.equal((await send("[PR ready] https://github.com/owner/repo/pull/123 is marked ready", "system")).action, "reject");
-    assert.equal((await send("Please continue", "user")).action, "proceed");
-    const task = (await s.harness.behavior.callRpc("envoys_get", { threadId: envoy.threadId })) as any;
-    assert.equal(task.lifecycle, "active");
+    for (const lifecycle of ["completed", "parked"] as const) {
+      await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle });
+      assert.equal((await send("[PR ready] https://github.com/owner/repo/pull/123 is marked ready", "system")).action, "reject");
+      assert.equal((await send("Please continue", "user")).action, "proceed");
+      const task = (await s.harness.behavior.callRpc("envoys_get", { threadId: envoy.threadId })) as any;
+      assert.equal(task.lifecycle, "active");
+    }
   } finally {
     await s.harness.lifecycle.dispose();
   }

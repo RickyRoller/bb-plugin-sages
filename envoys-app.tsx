@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   experimental_NewThreadComposer as NewThreadComposer,
+  Markdown,
   useBbNavigate,
   useRealtime,
   useRpc,
@@ -394,6 +401,60 @@ function EnvoyHeader({ threadId }: PluginThreadHeaderActionProps) {
     </div>
   ) : null;
 }
+const LIFECYCLE_STYLE: Record<Envoy["lifecycle"], string> = {
+  creating: "bg-muted text-muted-foreground",
+  active: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
+  parked: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+  completed: "bg-sky-500/15 text-sky-700 dark:text-sky-400",
+  cancelled: "bg-destructive/15 text-destructive",
+};
+/** What each lifecycle action does, shown on hover instead of a paragraph. */
+const ACTIONS = {
+  active: {
+    label: "Resume",
+    hint: "Continue the task and restore its PR watchers.",
+  },
+  parked: {
+    label: "Park",
+    hint: "Pause work and remove PR watchers. The workspace, chat and handoff worker stay.",
+  },
+  completed: {
+    label: "Mark completed",
+    hint: "Save its final output and archive its thread, with its child threads, PR watchers and worktree. Resume brings it back.",
+  },
+  cancelled: {
+    label: "Cancel task",
+    hint: "Stop all work, including child threads, and remove PR watchers.",
+  },
+} as const;
+
+/** Shows what an action does on hover. */
+function Hint({ text, children }: { text: string; children: ReactNode }) {
+  return (
+    <span className="inline-flex" title={text}>
+      {children}
+    </span>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="space-y-2">
+      <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+type Overview = {
+  project?: string;
+  agent?: string;
+  workspace?: string;
+  path?: string;
+};
+
 function EnvoyDetails({
   envoy,
   onClose,
@@ -402,9 +463,8 @@ function EnvoyDetails({
   onClose: () => void;
 }) {
   const rpc = useRpc<typeof envoyRpcContract>();
-  const navigate = useBbNavigate();
   const sdk = useSdk();
-  const [context, setContext] = useState<string[]>([]);
+  const [overview, setOverview] = useState<Overview>({});
   useEffect(() => {
     let stale = false;
     void (async () => {
@@ -417,41 +477,37 @@ function EnvoyDetails({
           ? sdk.threads.defaultExecutionOptions({ threadId: envoy.threadId })
           : Promise.resolve(null),
       ]);
-      const lines: string[] = [];
-      if (project.status === "fulfilled") lines.push(project.value.name);
+      const next: Overview = {};
+      if (project.status === "fulfilled") next.project = project.value.name;
       if (thread.status === "fulfilled" && thread.value) {
         const options =
           execution.status === "fulfilled" ? execution.value : null;
-        lines.push(
-          [
-            thread.value.providerId,
-            options?.model,
-            options?.reasoningLevel,
-            options?.permissionMode,
-          ]
-            .filter(Boolean)
-            .join(" · "),
-        );
+        next.agent = [
+          thread.value.providerId,
+          options?.model,
+          options?.reasoningLevel,
+          options?.permissionMode,
+        ]
+          .filter(Boolean)
+          .join(" · ");
         if (thread.value.environmentId) {
           try {
             const workspace = await sdk.environments.get({
               environmentId: thread.value.environmentId,
             });
-            lines.push(
-              [
-                workspace.isWorktree ? "BB worktree" : "Workspace",
-                workspace.branchName,
-              ]
-                .filter(Boolean)
-                .join(" · "),
-            );
-            if (workspace.path) lines.push(workspace.path);
+            next.workspace = [
+              workspace.isWorktree ? "BB worktree" : "Workspace",
+              workspace.branchName,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            next.path = workspace.path ?? undefined;
           } catch {
-            lines.push("Workspace details unavailable");
+            next.workspace = "Unavailable";
           }
-        } else lines.push("Preparing workspace");
+        } else next.workspace = "Preparing";
       }
-      if (!stale) setContext(lines);
+      if (!stale) setOverview(next);
     })().catch(() => {});
     return () => {
       stale = true;
@@ -474,6 +530,15 @@ function EnvoyDetails({
       setPending(false);
     }
   }
+  const edited =
+    name.trim() !== envoy.name || issue.trim() !== (envoy.issue?.url ?? "");
+  const setLifecycle = (lifecycle: keyof typeof ACTIONS) =>
+    void run(() => rpc.call("envoys_lifecycle", { id: envoy.id, lifecycle }));
+  const rows: [string, string | undefined, string?][] = [
+    ["Project", overview.project],
+    ["Agent", overview.agent],
+    ["Workspace", overview.workspace, overview.path],
+  ];
   return (
     <Dialog
       open
@@ -481,157 +546,211 @@ function EnvoyDetails({
         if (!value) onClose();
       }}
     >
-      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Envoy details</DialogTitle>
-          <DialogDescription>
-            {envoy.lifecycle} · {envoy.specialist ?? "BB agent"}
+      {/* Header and actions stay put; everything between them scrolls. */}
+      <DialogContent className="flex max-h-[90vh] max-w-2xl flex-col gap-5 overflow-hidden">
+        <DialogHeader className="space-y-2 pr-6">
+          <DialogTitle className="text-lg leading-snug">
+            {envoy.name}
+          </DialogTitle>
+          <DialogDescription asChild>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span
+                className={`rounded-full px-2 py-0.5 font-medium capitalize ${LIFECYCLE_STYLE[envoy.lifecycle]}`}
+              >
+                {envoy.lifecycle}
+              </span>
+              <span>Led by {envoy.specialist ?? "a BB agent"}</span>
+              {envoy.issue ? (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <UrlLink href={envoy.issue.url}>{envoy.issue.key}</UrlLink>
+                </>
+              ) : null}
+            </div>
           </DialogDescription>
         </DialogHeader>
-        {context.length ? (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {context.map((line, index) => (
-              <p className="break-all" key={index}>
-                {line}
-              </p>
-            ))}
-          </div>
-        ) : null}
-        <p className="whitespace-pre-wrap text-sm">{envoy.directive}</p>
-        <label className="space-y-1 text-sm">
-          Name
-          <Input
-            value={name}
-            maxLength={80}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </label>
-        <label className="space-y-1 text-sm">
-          Issue link
-          <Input
-            value={issue}
-            maxLength={2000}
-            onChange={(e) => setIssue(e.target.value)}
-          />
-        </label>
-        <Button
-          disabled={pending || !name.trim()}
-          onClick={() =>
-            void run(() =>
-              rpc.call("envoys_update", {
-                id: envoy.id,
-                name,
-                issueUrl: issue,
-              }),
-            )
-          }
-        >
-          Save details
-        </Button>
-        <div className="space-y-2 border-t border-border pt-3">
-          <p className="text-sm font-medium">Pull requests</p>
-          <p className="text-xs text-muted-foreground">
-            Open drafts; mark ready yourself or ask this Envoy. With a ready-PR
-            handoff specialist set in Sages settings, each attached PR gets a
-            watcher automation owned by the Envoy, which tells the Envoy to hand
-            it off once it is ready. Parking or cancelling removes watchers.
-          </p>
-          {envoy.prs.map((pr) => (
-            <div
-              className="space-y-1 rounded-md border border-border p-2 text-sm"
-              key={pr.url}
-            >
-              <UrlLink href={pr.url}>
-                {pr.owner}/{pr.repo} #{pr.number}
-              </UrlLink>
-              <div className="flex gap-2">
-                <Button
-                  className="h-7 text-xs"
-                  disabled={pending}
-                  variant="ghost"
-                  onClick={() =>
-                    void run(() =>
-                      rpc.call("envoys_pr", {
-                        id: envoy.id,
-                        url: pr.url,
-                        action: "detach",
-                      }),
-                    )
-                  }
-                >
-                  Detach
-                </Button>
-              </div>
+
+        <div className="-mx-1 min-h-0 flex-1 space-y-6 overflow-y-auto px-1">
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-xs">
+            {rows.map(([label, value, title]) =>
+              value ? (
+                <div className="contents" key={label}>
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd className="truncate" title={title}>
+                    {value}
+                  </dd>
+                </div>
+              ) : null,
+            )}
+          </dl>
+
+          <Section title="Task">
+            <div className="max-h-56 overflow-y-auto rounded-md bg-muted/40 px-3 py-2 text-sm">
+              <Markdown content={envoy.directive} />
             </div>
-          ))}
-          <label className="space-y-1 text-sm">
-            Attach a PR
-            <Input
-              placeholder="https://github.com/owner/repo/pull/123"
-              value={prUrl}
-              maxLength={2000}
-              onChange={(e) => setPrUrl(e.target.value)}
-            />
-          </label>
-          <Button
-            disabled={pending || !prUrl.trim()}
-            variant="outline"
-            onClick={() =>
-              void run(async () => {
-                await rpc.call("envoys_pr", {
-                  id: envoy.id,
-                  url: prUrl,
-                  action: "attach",
+          </Section>
+
+          <Section title="Pull requests">
+            {envoy.prs.length ? (
+              <ul className="divide-y divide-border rounded-md border border-border">
+                {envoy.prs.map((pr) => (
+                  <li
+                    className="flex items-center justify-between gap-2 py-1 pl-3 pr-1 text-sm"
+                    key={pr.url}
+                  >
+                    <UrlLink href={pr.url}>
+                      {pr.owner}/{pr.repo} #{pr.number}
+                    </UrlLink>
+                    <Button
+                      aria-label={`Detach ${pr.owner}/${pr.repo} #${pr.number}`}
+                      className="h-7 w-7 text-muted-foreground"
+                      disabled={pending}
+                      size="icon"
+                      variant="ghost"
+                      onClick={() =>
+                        void run(() =>
+                          rpc.call("envoys_pr", {
+                            id: envoy.id,
+                            url: pr.url,
+                            action: "detach",
+                          }),
+                        )
+                      }
+                    >
+                      ×
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">None attached.</p>
+            )}
+            <form
+              className="flex gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!prUrl.trim()) return;
+                void run(async () => {
+                  await rpc.call("envoys_pr", {
+                    id: envoy.id,
+                    url: prUrl,
+                    action: "attach",
+                  });
+                  setPrUrl("");
                 });
-                setPrUrl("");
-              })
-            }
-          >
-            Attach PR
-          </Button>
-        </div>
-        <ErrorLine error={error ?? envoy.error} />
-        <div className="flex flex-wrap gap-2 border-t border-border pt-3">
-          {(
-            [
-              envoy.lifecycle === "active" ? "parked" : "active",
-              "completed",
-              "cancelled",
-            ] as const
-          )
-            .filter((state) => state !== envoy.lifecycle)
-            .map((state) => (
+              }}
+            >
+              <Input
+                aria-label="Pull request URL"
+                className="h-8 text-sm"
+                placeholder="https://github.com/owner/repo/pull/123"
+                value={prUrl}
+                maxLength={2000}
+                onChange={(e) => setPrUrl(e.target.value)}
+              />
               <Button
-                key={state}
-                disabled={pending}
+                disabled={pending || !prUrl.trim()}
+                size="sm"
+                type="submit"
                 variant="outline"
+              >
+                Attach PR
+              </Button>
+            </form>
+          </Section>
+
+          <Section title="Edit">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="space-y-1">
+                <span className="text-xs text-muted-foreground">Name</span>
+                <Input
+                  className="h-8 text-sm"
+                  value={name}
+                  maxLength={80}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </label>
+              <label className="space-y-1">
+                <span className="text-xs text-muted-foreground">
+                  Issue link
+                </span>
+                <Input
+                  className="h-8 text-sm"
+                  placeholder="https://…"
+                  value={issue}
+                  maxLength={2000}
+                  onChange={(e) => setIssue(e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="flex justify-end">
+              <Button
+                disabled={pending || !edited || !name.trim()}
+                size="sm"
+                variant="secondary"
                 onClick={() =>
                   void run(() =>
-                    rpc.call("envoys_lifecycle", {
+                    rpc.call("envoys_update", {
                       id: envoy.id,
-                      lifecycle: state,
+                      name,
+                      issueUrl: issue,
                     }),
                   )
                 }
               >
-                {state === "active"
-                  ? "Resume task"
-                  : state === "parked"
-                    ? "Park task"
-                    : state === "completed"
-                      ? "Mark completed"
-                      : "Cancel task"}
+                Save
               </Button>
-            ))}
+            </div>
+          </Section>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Parking preserves the workspace and chat and the Envoy's handoff
-          worker, and removes its PR watchers; resuming restores them.
-          Completing a task keeps its watchers, so a ready PR still reaches the
-          Envoy to hand off. Cancelling stops all of the Envoy's child threads
-          and removes its watchers. Sending a user message to a parked
-          or completed task resumes the task; automated notices do not.
-        </p>
+
+        <div className="shrink-0 space-y-2 border-t border-border pt-4">
+          <ErrorLine error={error ?? envoy.error} />
+          <div className="flex flex-wrap items-center gap-2">
+            {envoy.lifecycle !== "cancelled" ? (
+              <Hint text={ACTIONS.cancelled.hint}>
+                <Button
+                  className="text-destructive hover:text-destructive"
+                  disabled={pending}
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setLifecycle("cancelled")}
+                >
+                  {ACTIONS.cancelled.label}
+                </Button>
+              </Hint>
+            ) : null}
+            <div className="ml-auto flex gap-2">
+              {(() => {
+                const toggle =
+                  envoy.lifecycle === "active" ? "parked" : "active";
+                return (
+                  <Hint text={ACTIONS[toggle].hint}>
+                    <Button
+                      disabled={pending}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setLifecycle(toggle)}
+                    >
+                      {ACTIONS[toggle].label}
+                    </Button>
+                  </Hint>
+                );
+              })()}
+              {envoy.lifecycle !== "completed" ? (
+                <Hint text={ACTIONS.completed.hint}>
+                  <Button
+                    disabled={pending}
+                    size="sm"
+                    onClick={() => setLifecycle("completed")}
+                  >
+                    {ACTIONS.completed.label}
+                  </Button>
+                </Hint>
+              ) : null}
+            </div>
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
   );

@@ -87,8 +87,9 @@ Envoy with `[PR ready] …` and deletes itself, and the Envoy hands the PR off i
 with `specialist_handoff`. Do not hand off for it. With no specialist chosen, attached
 PRs get no watcher. `gh` must be installed and authenticated on the BB server's machine.
 
-Parking, cancelling, or archiving an Envoy deletes its watchers; resuming a parked
-Envoy recreates them. Automated messages cannot resume parked/completed tasks, except
-the `[PR ready]` message to a completed one; a user message resumes those tasks.
+Parking, completing, cancelling, or archiving an Envoy deletes its watchers; resuming
+recreates them. Complete saves the final output and archives the Envoy's thread
+(with its child threads and worktree); resume brings it back. Automated messages
+cannot resume parked/completed tasks; a user message resumes those tasks.
 Cancelled tasks require Resume. Parking keeps the Envoy's handoff worker running;
 cancelling stops it.

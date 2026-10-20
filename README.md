@@ -72,17 +72,18 @@ checks it ran. The specialist keeps its own instructions for the follow-up; noth
 that procedure lives in Sages. The plugin never polls GitHub itself. With no specialist
 chosen, attached PRs are only listed.
 
-Watchers never outlive their Envoy: parking, cancelling, or archiving the Envoy's thread
-deletes them, and detaching a PR deletes its watcher. Resuming a parked Envoy creates them
-again. A completed Envoy keeps its watchers, and the `[PR ready]` message is the one
-automated message that reaches it, so it can still hand off.
+Watchers never outlive their Envoy: parking, completing, cancelling, or archiving the
+Envoy's thread deletes them, and detaching a PR deletes its watcher. Resuming creates them
+again.
 
 Park stops implementation threads while preserving the visible chat, workspace and the
-Envoy's handoff worker (its child thread running the chosen specialist). Resume continues
-the directive; complete stores the task's final output. Cancel stops all of the Envoy's
-child threads. Other automated notices cannot resume parked, completed or cancelled
-tasks. A user message resumes parked or completed tasks. Cancelled tasks require Resume.
-These actions do not delete the workspace; cleanup remains a separate native BB action.
+Envoy's handoff worker (its child thread running the chosen specialist). **Complete**
+closes the Envoy out: it stores the task's final output, then archives its thread, which
+takes its child threads (including the handoff worker) and retires its worktree. The chat
+stays readable, and Resume unarchives it and rebuilds the worktree when the provider can.
+Cancel stops all of the Envoy's child threads. Automated notices cannot resume parked,
+completed or cancelled tasks. A user message resumes parked or completed tasks. Cancelled
+tasks require Resume.
 
 A sage starts one with its `sage_envoy(task, project?, name?, issueUrl?,
 specialist?, requestId?)` tool, which takes a project id or name and creates
