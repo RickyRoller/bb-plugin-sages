@@ -6,14 +6,12 @@
 // fresh, hidden bb thread whose first input is the view of that tree. This
 // file owns the sage records, the turns, the logging of what a turn's thread
 // does, the zoom/date tools, the compaction model call, and the CLI.
-import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
-import { promisify } from "node:util";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
 import { registerEnvoys } from "./envoys.ts";
+import { MissingCli, runDirect } from "./harness.ts";
 import {
   COMPACTION_PROMPT,
   HANDOFF_PROMPT,
@@ -77,7 +75,39 @@ const turnRequestSchema = z.looseObject({
   input: z.array(promptPartSchema).min(1),
 });
 
+/**
+ * The model that writes summaries, as bb's provider/model picker chose it;
+ * null runs them on bb's defaults.
+ */
+const summaryModelSchema = z
+  .object({
+    providerId: z.string().min(1),
+    model: z.string().min(1),
+    reasoningLevel: z.string().min(1),
+    serviceTier: z.string().optional(),
+  })
+  .nullable();
+/** Choices made with bb's own pickers, so they follow what bb has set up. */
+const preferencesSchema = z.object({
+  summaryModel: summaryModelSchema.default(null),
+  /** The specialist started when an Envoy's attached PR is ready; "" for none. */
+  readyHandoffSpecialist: z.string().default(""),
+});
+export type Preferences = z.infer<typeof preferencesSchema>;
+
 export const rpcContract = defineRpcContract({
+  sages_preferences: {
+    input: z.null(),
+    output: preferencesSchema,
+  },
+  sages_set_preferences: {
+    // No defaults here: a field left out keeps its saved value.
+    input: z.object({
+      summaryModel: summaryModelSchema.optional(),
+      readyHandoffSpecialist: z.string().optional(),
+    }),
+    output: preferencesSchema,
+  },
   sages_list: {
     input: z.null(),
     output: z.object({ sages: z.array(listedSageSchema) }),
@@ -269,31 +299,57 @@ const errorText = (cause: unknown) =>
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    compactionModel: {
+    envoyPreparedProjects: {
       type: "string",
-      label: "Compaction model",
+      label: "Envoy prepared projects",
       description:
-        "The cheap model that summarizes the chat in the background, as a Claude Code model name.",
-      default: "haiku",
+        "Comma-separated project IDs whose base checkout is prepared before each new Envoy: fast-forward origin's default branch, then run the Envoy install command. Requires a clean source; other projects keep native BB setup.",
+      default: "",
     },
-    compactionEffort: {
-      type: "select",
-      label: "Compaction effort",
-      options: ["low", "medium", "high", "xhigh", "max"],
-      default: "xhigh",
-    },
-    claudePath: {
+    envoyInstallCommand: {
       type: "string",
-      label: "Claude Code command",
+      label: "Envoy install command",
       description:
-        "The claude CLI that runs compactions. Leave as is to find it on your shell's PATH.",
-      default: "claude",
+        "Shell command that installs dependencies in a prepared base checkout (for example npm ci, or bun install --frozen-lockfile). Envoys are asked to run it in their new worktree too. Leave empty to skip installing.",
+      default: "",
+    },
+    envoyReadyHandoffInstructions: {
+      type: "string",
+      label: "Ready-PR handoff instructions",
+      description:
+        "Extra instructions sent to the ready-PR handoff specialist (chosen below) with each PR, such as your CI and review procedure.",
+      experimental_multiline: true,
+      default: "",
+    },
+    envoyIssueHosts: {
+      type: "string",
+      label: "Envoy issue hosts",
+      description:
+        "Comma-separated hostnames allowed for Envoy issue links (for example linear.app or yourteam.atlassian.net). Leave empty to accept any https link.",
+      default: "",
     },
   });
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
-  const envoys = await registerEnvoys(bb);
+  const list = (value: string) =>
+    value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  let preferences = preferencesSchema
+    .catch(preferencesSchema.parse({}))
+    .parse((await bb.storage.kv.get("preferences")) ?? {});
+  const envoys = await registerEnvoys(bb, async () => {
+    const values = await settings.get();
+    return {
+      preparedProjects: list(values.envoyPreparedProjects),
+      installCommand: values.envoyInstallCommand.trim(),
+      handoffSpecialist: preferences.readyHandoffSpecialist,
+      handoffInstructions: values.envoyReadyHandoffInstructions,
+      issueHosts: list(values.envoyIssueHosts.toLowerCase()),
+    };
+  });
 
   // bb.agents.configure is synchronous, so sages are served from memory and
   // written through to storage.
@@ -367,86 +423,96 @@ export default async function plugin(bb: BbPluginApi) {
     return sage;
   }
 
-  // --- Compaction calls: the claude CLI, headless, with no tools. ---
+  // --- Compaction calls: a hidden bb thread on the chosen model. ---
 
-  let claude: Promise<string> | null = null;
-  /** The claude binary: the setting as given, or looked up in the user's shell. */
-  function findClaude(command: string): Promise<string> {
-    claude ??= promisify(execFile)(command, ["--version"]).then(
-      () => command,
-      async () => {
-        const { stdout } = await promisify(execFile)(
-          process.env.SHELL ?? "/bin/sh",
-          ["-ilc", `command -v ${JSON.stringify(command)}`],
-        );
-        const found = stdout.trim().split("\n").pop() ?? "";
-        if (found === "") throw new Error(`"${command}" was not found`);
-        return found;
-      },
-    );
-    claude.catch(() => {
-      claude = null;
-    });
-    return claude;
-  }
-  const summarize: Summarize = (conversation, signal) =>
-    // A retry is the same conversation, resent whole in one prompt.
-    runClaude(
-      COMPACTION_PROMPT,
-      conversation
-        .map((message, index) =>
-          index % 2 === 0 ? message : `Your line was:\n${message}`,
-        )
-        .join("\n\n"),
-      signal,
-    );
-  async function runClaude(
+  /** Metadata that marks a summary thread, so it gets no sage tools. */
+  const SUMMARY_THREAD = "sagesSummary";
+
+  /**
+   * One tool-less call on the summary model: straight to its provider's CLI
+   * when it has a print mode, else in a hidden bb thread.
+   */
+  async function runModel(
+    sageId: string,
     system: string,
     prompt: string,
     signal: AbortSignal,
   ): Promise<string> {
-    const { compactionModel, compactionEffort, claudePath } =
-      await settings.get();
-    const command = await findClaude(claudePath);
-    return new Promise((resolve, reject) => {
-      const child = spawn(
-        command,
-        [
-          "-p",
-          ...["--model", compactionModel],
-          ...["--effort", compactionEffort],
-          ...["--system-prompt", system],
-          ...["--tools", ""],
-          ...["--setting-sources", ""],
-          "--strict-mcp-config",
-          "--disable-slash-commands",
-          "--no-session-persistence",
-        ],
-        {
-          cwd: tmpdir(),
-          signal: AbortSignal.any([signal, AbortSignal.timeout(180_000)]),
-          stdio: ["pipe", "pipe", "pipe"],
-        },
-      );
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => (stdout += chunk));
-      child.stderr.on("data", (chunk) => (stderr += chunk));
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code === 0) resolve(stdout);
-        else {
-          reject(
-            new Error(
-              `claude exited with ${code}: ${(stderr || stdout).trim().slice(0, 300)}`,
-            ),
-          );
-        }
-      });
-      child.stdin.on("error", () => {});
-      child.stdin.end(prompt);
-    });
+    const choice = preferences.summaryModel;
+    if (choice !== null) {
+      try {
+        const answer = await runDirect(choice, system, prompt, signal);
+        if (answer !== null) return answer;
+      } catch (error) {
+        if (!(error instanceof MissingCli)) throw error;
+        bb.log.warn(`${errorText(error)}; summarizing in a bb thread instead`);
+      }
+    }
+    return runInThread(sageId, system, prompt, signal);
   }
+
+  /**
+   * The same call in a hidden thread that reuses the sage's workspace and is
+   * deleted after, so any bb provider can run it.
+   */
+  async function runInThread(
+    sageId: string,
+    system: string,
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const sage = findSage(sageId);
+    const source =
+      sage.threadId ??
+      (sage.parentId === null ? null : findSage(sage.parentId).threadId);
+    if (source === null) throw new Error(`${sage.name} has no turn yet`);
+    const turn = await bb.sdk.threads.get({ threadId: source });
+    if (!turn.environmentId)
+      throw new Error(`${sage.name}'s workspace is not ready`);
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(300_000)]);
+    const thread = await bb.sdk.threads.spawn({
+      projectId: turn.projectId,
+      environment: { type: "reuse", environmentId: turn.environmentId },
+      ...(preferences.summaryModel ?? {}),
+      permissionMode: "accept-edits",
+      visibility: "hidden",
+      title: `${sage.name} memory`,
+      pluginMetadata: { [SUMMARY_THREAD]: true },
+      input: [
+        { type: "text", text: system, visibility: "agent-only", mentions: [] },
+        { type: "text", text: prompt, mentions: [] },
+      ],
+    } as unknown as Parameters<typeof bb.sdk.threads.spawn>[0]);
+    try {
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        deadline.throwIfAborted();
+        const { status } = await bb.sdk.threads.get({ threadId: thread.id });
+        if (status === "error") throw new Error("The summary thread failed");
+        if (status === "idle") break;
+      }
+      const { output } = await bb.sdk.threads.output({ threadId: thread.id });
+      return output ?? "";
+    } finally {
+      bb.sdk.threads
+        .delete({ threadId: thread.id, childThreadsConfirmed: true })
+        .catch(() => {});
+    }
+  }
+  const summarize =
+    (sageId: string): Summarize =>
+    (conversation, signal) =>
+      // A retry is the same conversation, resent whole in one prompt.
+      runModel(
+        sageId,
+        COMPACTION_PROMPT,
+        conversation
+          .map((message, index) =>
+            index % 2 === 0 ? message : `Your line was:\n${message}`,
+          )
+          .join("\n\n"),
+        signal,
+      );
 
   // --- Chats ---
 
@@ -454,7 +520,7 @@ export default async function plugin(bb: BbPluginApi) {
   function chatOf(sageId: string): Chat {
     let chat = chats.get(sageId);
     if (chat === undefined) {
-      chat = new Chat(db, sageId, summarize, (error) => {
+      chat = new Chat(db, sageId, summarize(sageId), (error) => {
         // An abort is a reload or shutdown, not a failure.
         if (
           error !== undefined &&
@@ -818,7 +884,8 @@ export default async function plugin(bb: BbPluginApi) {
       log = chat.render();
     }
     const summary = (
-      await runClaude(
+      await runModel(
+        acolyte.id,
         ACOLYTE_SUMMARY_PROMPT,
         `<acolyte>\n${log}\n</acolyte>\nName: ${acolyte.name}\nFocus: ${acolyte.topic || "none given"}`,
         AbortSignal.timeout(300_000),
@@ -1089,6 +1156,13 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
+    sages_preferences: () => preferences,
+    sages_set_preferences: async (patch) => {
+      const next = preferencesSchema.parse({ ...preferences, ...patch });
+      await bb.storage.kv.set("preferences", next);
+      preferences = next;
+      return preferences;
+    },
     sages_list: () => ({
       sages: sages.map((sage) => ({ ...sage, stats: chatOf(sage.id).stats() })),
     }),
@@ -1277,6 +1351,8 @@ export default async function plugin(bb: BbPluginApi) {
   // A thread is a sage's turn when its metadata names a sage. The metadata
   // is writable by any client; all it unlocks is reading that sage's chat.
   bb.agents.configure((context) => {
+    if (context.pluginMetadata[SUMMARY_THREAD] === true)
+      return { tools: [], skills: [] };
     const { sageId } = context.pluginMetadata;
     const sage = sages.find((candidate) => candidate.id === sageId);
     // Ordinary threads get the CLI skill so "create a sage/acolyte" finds it;

@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { access } from "node:fs/promises";
 import { promisify } from "node:util";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { envoyHostContract } from "./envoy-contract.ts";
+import { userPath } from "./harness.ts";
+import { prepareSource } from "./source-preparation.ts";
 
 const exec = promisify(execFile);
 const response = z.object({
@@ -14,19 +15,11 @@ const response = z.object({
 export default experimental_defineHostEntry({
   contract: envoyHostContract,
   handlers: {
+    prepareSource: ({ path, installCommand }, { signal }) =>
+      prepareSource(path, installCommand, signal),
     async prState({ owner, repo, number }, { signal }) {
-      let command = "gh";
-      for (const path of ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]) {
-        try {
-          await access(path);
-          command = path;
-          break;
-        } catch {
-          /* Use PATH if absent. */
-        }
-      }
       const { stdout } = await exec(
-        command,
+        "gh",
         [
           "pr",
           "view",
@@ -40,7 +33,7 @@ export default experimental_defineHostEntry({
           signal,
           timeout: 20_000,
           maxBuffer: 64 * 1024,
-          env: { ...process.env, GH_PROMPT_DISABLED: "1" },
+          env: { ...process.env, PATH: await userPath(), GH_PROMPT_DISABLED: "1" },
         },
       );
       const pr = response.parse(JSON.parse(stdout));

@@ -52,7 +52,7 @@ const envoy = {
   lifecycle: "active",
   creation: "ready",
   error: null,
-  issue: { key: "WAL-123", url: "https://linear.app/wallet/issue/WAL-123" },
+  issue: { key: "ABC-123", url: "https://tracker.example.com/issue/ABC-123" },
   specialist: null,
   prs: [],
   result: null,
@@ -80,7 +80,7 @@ const sdk = {
     }),
   },
   projects: {
-    get: async () => ({ name: "Wallet" }),
+    get: async () => ({ name: "Example" }),
     branches: async () => ({
       checkout: { kind: "branch" },
       branches: ["main"],
@@ -88,7 +88,7 @@ const sdk = {
     list: async () => [
       {
         id: "project-1",
-        name: "Wallet",
+        name: "Example",
         gitRemoteUrl: null,
         sources: [{ hostId: "host-1", isDefault: true }],
       },
@@ -132,9 +132,9 @@ test("creation dialog defaults to an ordinary agent, worktree, optional name/iss
     const task = document.querySelector(
       '[data-testid="bb-new-thread-composer-input"]',
     );
-    fireEvent.change(task, { target: { value: "Fix saved-swap crash" } });
+    fireEvent.change(task, { target: { value: "Fix login crash" } });
     fireEvent.change(
-      document.querySelector('input[placeholder^="https://linear"]'),
+      document.querySelector('input[placeholder^="https://tracker"]'),
       { target: { value: envoy.issue.url } },
     );
     fireEvent.click(
@@ -156,7 +156,7 @@ test("creation dialog defaults to an ordinary agent, worktree, optional name/iss
   }
 });
 
-test("task list opens the primary thread and renders Linear as a separate link", async () => {
+test("task list opens the primary thread and renders the issue as a separate link", async () => {
   const slot = renderSlot(
     { component: EnvoyList },
     {},
@@ -165,7 +165,7 @@ test("task list opens the primary thread and renders Linear as a separate link",
   try {
     await waitFor(() => assert.ok(slot.queryByText("Fix crash")));
     assert.equal(
-      slot.getByText("WAL-123").getAttribute("href"),
+      slot.getByText("ABC-123").getAttribute("href"),
       envoy.issue.url,
     );
     fireEvent.click(slot.getByText("Fix crash"));

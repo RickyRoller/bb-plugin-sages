@@ -134,13 +134,13 @@ function NewEnvoyDialog({
           />
         </label>
         <label className="space-y-1 text-sm">
-          Linear issue <span className="text-muted-foreground">(optional)</span>
+          Issue link <span className="text-muted-foreground">(optional)</span>
           <Input
             value={issueUrl}
             maxLength={2000}
             disabled={pending}
             onChange={(e) => setIssueUrl(e.target.value)}
-            placeholder="https://linear.app/workspace/issue/WAL-123"
+            placeholder="https://tracker.example.com/issue/ABC-123"
           />
         </label>
         <details>
@@ -508,7 +508,7 @@ function EnvoyDetails({
           />
         </label>
         <label className="space-y-1 text-sm">
-          Linear issue
+          Issue link
           <Input
             value={issue}
             maxLength={2000}
@@ -533,7 +533,8 @@ function EnvoyDetails({
           <p className="text-sm font-medium">Pull requests</p>
           <p className="text-xs text-muted-foreground">
             Only attached PRs are checked. Open drafts; mark ready yourself or
-            ask this Envoy. Readiness starts pr-handoff.
+            ask this Envoy. Readiness starts the ready-PR handoff specialist,
+            if one is set in Sages settings.
           </p>
           {envoy.prs.map((pr) => (
             <div
@@ -558,7 +559,7 @@ function EnvoyDetails({
                   type="button"
                   onClick={() => navigate.toThread(pr.handoffThreadId!)}
                 >
-                  Open pr-handoff
+                  Open handoff
                 </button>
               ) : null}
               <div className="flex gap-2">
@@ -715,11 +716,11 @@ function EnvoyDetails({
         </div>
         <p className="text-xs text-muted-foreground">
           Parking preserves the workspace and chat. Attached PR monitoring and
-          scheduled review reminders continue. Completing a task also preserves
-          PR follow-up. Cancelling stops readiness monitoring and handoff
-          agents; any already-scheduled reminder is managed separately in
-          Automations. After resuming a cancelled task, open its pr-handoff
-          thread to resume a stopped worker. Sending a user message to a parked
+          handoff agents continue. Completing a task also preserves PR
+          follow-up. Cancelling stops readiness monitoring and handoff agents;
+          anything they scheduled elsewhere, such as automations, is managed
+          there. After resuming a cancelled task, open its handoff thread to
+          resume a stopped worker. Sending a user message to a parked
           or completed task resumes the task; automated notices do not.
         </p>
       </DialogContent>

@@ -24,10 +24,31 @@ Run `npm test` for engine, Envoy lifecycle and frontend interaction tests and `n
 An Envoy is a task with one stable, visible BB thread and a dedicated workspace.
 Open **Sages → Envoys → New Envoy**, or use the **New Envoy** command palette action.
 Describe the task; the name is optional and defaults to the first line of the directive.
-A full Linear issue URL is optional and appears in the chat header and Sidebar Thread
+A full https issue link from any tracker is optional (restrict its hosts with
+`envoyIssueHosts`) and appears in the chat header and Sidebar Thread
 Details row. Git projects default to a fresh BB worktree, including local repositories
 without a remote. BB's composer controls the machine, base branch, model and permissions.
 The details dialog shows project, workspace, branch and execution settings.
+
+For dedicated base checkouts, set the Sages setting `envoyPreparedProjects` to
+comma-separated BB project IDs. Select the project whose source is the intended base
+repository (the allocator passes `--project`). On each new Envoy, preparation runs on
+the source machine **before** BB creates the worktree: require a clean default branch,
+fetch origin's current default branch, fast-forward without discarding local commits,
+and run `envoyInstallCommand` (for example `npm ci` or `bun install --frozen-lockfile`)
+in an interactive login shell, so the PATH and version managers your shell sets up apply. An empty command skips installing.
+The worktree is pinned to the prepared commit. Configured projects require a new
+worktree from the default branch; checkout reuse and explicit branch overrides are
+rejected. Other projects keep native BB provisioning. The Worktree plugin must be enabled.
+
+Preparation failures prevent spawn and can be retried with `recover` after correction.
+A filesystem lock prevents concurrent preparations of the same repository. An interrupted
+host process may leave `envoy-prepare.lock` in the Git common directory: inspect the
+running processes before removing that empty lock directory. No reset or stash occurs.
+Source installs warm shared caches; they do not populate a new worktree's dependencies.
+The Envoy is instructed to follow repo worktree setup and run the install command in its
+worktree before editing or validating. For a
+provisioning-level worktree install, use BB's tracked `.bb-env-setup.sh` hook.
 
 An ordinary BB agent leads by default. An optional specialist lead supplies execution defaults at launch;
 changing the lead never resets the composer. Explicit execution selections take precedence. Each startup lists available specialists
@@ -39,8 +60,10 @@ PRs must be opened as drafts and attached with `envoy_attach_pr` or the details 
 Only Envoys with attached PRs allocate a polling timer or make GitHub requests. Readiness
 is checked once per minute on the workspace's machine through authenticated `gh`; the
 plugin never discovers PRs by branch and never marks them ready. Once the user marks a
-PR ready (or explicitly asks the Envoy to), the plugin starts the mandatory `pr-handoff`
-specialist for the existing required-CI and six-hour review-reminder procedure. Its worker
+PR ready (or explicitly asks the Envoy to), the plugin starts the specialist chosen as
+**Ready-PR handoff specialist**, with the PR, its head and `envoyReadyHandoffInstructions`
+(your CI or review procedure, if any). Leave the specialist empty for no automatic
+handoff: attached PRs are then listed but never polled. Its worker
 is parented to the Envoy and recovered by a persisted key across reloads or interrupted
 responses. Readiness polling stops after handoff, detachment, closure or merge. Missing
 specialists and GitHub failures appear in task details with a retry action.
@@ -60,12 +83,11 @@ the task's final output. Complete keeps attached PR follow-up. Cancel stops read
 handoff agents as well as implementation; resume the task before restarting PR
 follow-up. Automated notices cannot resume parked, completed or cancelled tasks.
 A user message resumes parked or completed tasks. Cancelled tasks require Resume.
-After resuming a cancelled task, open its pr-handoff thread to resume a stopped worker.
-Already-scheduled review reminders are independent Automations and can be managed
-there. These actions do not delete the workspace; cleanup remains a separate native BB action.
+After resuming a cancelled task, open its handoff thread to resume a stopped worker.
+Anything a handoff worker scheduled elsewhere, such as automations, is managed there. These actions do not delete the workspace; cleanup remains a separate native BB action.
 
 ```sh
-bb sages envoy create --project <id> --task 'Fix saved-swap crash' --issue https://linear.app/wallet/issue/WAL-123
+bb sages envoy create --project <id> --task 'Fix login crash' --issue https://tracker.example.com/issue/ABC-123
 bb sages envoy list --json
 bb sages envoy show <id>
 bb sages envoy park <id>
@@ -153,21 +175,38 @@ during a turn steer it as in any thread.
 - **Prompt cache.** The plugin cannot place cache marks. The view still only
   grows at its end between batches, so a provider that caches by prefix can
   reuse it.
-- **Compactions.** They run through the `claude` CLI in print mode with no
-  tools (`claude -p --model haiku --effort xhigh`), on your Claude Code login.
-  They have their own system prompt, so they do not share the turns' cache. A
-  retry resends the conversation in one prompt.
+- **Compactions.** Pick the provider, model and reasoning level with bb's own
+  picker under **Models and handoff** in the plugin's settings. Providers whose
+  CLI has a print mode are called directly, tool-less, with your own CLI config
+  (sign-in, gateways, custom providers), found on your interactive shell's PATH:
+  `claude -p` for Claude Code, `codex exec` for Codex, `pi -p` for Pi (see
+  `harness.ts`). Any other provider, a missing CLI, or no choice (bb's default)
+  runs in a short-lived hidden bb thread that reuses the sage's latest turn
+  workspace, gets no plugin tools, and is deleted when it answers. Compactions
+  have their own system prompt, so they do not share the turns' cache. A retry
+  resends the conversation in one prompt.
 - **Not built.** `zoom("Name")` for a specialist's whole chat (the report
   names its thread instead), imported memories (`note`), and images in
   `sage_zoom`.
 
 ## Settings
 
+The plugin's settings page has a **Models and handoff** section built from what
+bb already has set up:
+
+- **Summary model**: bb's provider/model/reasoning picker for compactions and
+  acolyte summaries. Unset, they run on bb's default.
+- **Ready-PR handoff specialist**: a list of your Specialists. Started when an
+  Envoy's attached PR is marked ready; with none, attached PRs are never polled.
+
+The remaining fields:
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `compactionModel` | `haiku` | The model that writes summaries. |
-| `compactionEffort` | `xhigh` | Its effort level. |
-| `claudePath` | `claude` | The `claude` CLI; looked up in your shell when not on the server's PATH. |
+| `envoyPreparedProjects` | empty | Project IDs whose base checkout is fast-forwarded before each new Envoy. |
+| `envoyInstallCommand` | empty | Shell command run in a prepared checkout, and asked of each new worktree. |
+| `envoyReadyHandoffInstructions` | empty | Extra instructions sent to that specialist with each PR. |
+| `envoyIssueHosts` | empty | Hostnames allowed for issue links; empty accepts any https link. |
 
 ## UI components
 

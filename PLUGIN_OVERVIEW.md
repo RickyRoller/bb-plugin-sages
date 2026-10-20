@@ -22,18 +22,20 @@ old ones in brief, and opens any line down to the original message when it
 needs more. The context stays the same size however long the chat gets.
 
 The chat is stored in this plugin's own database on the BB server. Summaries
-are written by Claude Haiku through the `claude` command, so Claude Code must
-be installed and signed in.
+are written on whichever provider, model and reasoning level you pick in the
+plugin settings: Claude Code, Codex and Pi are called directly through their
+CLIs; other providers, and BB's default, run in short-lived hidden BB threads.
 
 
 ## Envoys for bounded tasks
 
 Start an Envoy for a bug, issue or small feature. It gets a fresh workspace and
-one visible BB chat, with an optional name, Linear link and specialist lead.
+one visible BB chat, with an optional name, issue link and specialist lead.
 An ordinary agent leads by default and delegates appropriate work to specialists.
 Git projects start in a new worktree; the native composer controls models and permissions.
 
-Attached PRs start as drafts. When you mark one ready, the mandatory pr-handoff
-specialist handles CI and review follow-up. No attached PR means no GitHub polling.
+Attached PRs start as drafts. If you name a ready-PR handoff specialist in the
+settings, marking a PR ready hands it to that specialist for follow-up, with any
+instructions you set. Without one, or without an attached PR, nothing polls GitHub.
 Park a task to stop implementation while keeping its workspace and PR follow-up.
 Open the Envoys tab or use the New Envoy command palette action.

@@ -12,7 +12,7 @@ import {
   envoyRpcContract,
   envoyHostContract,
   specialistSchema,
-  linearIssue,
+  issueLink,
   githubPr,
   taskName,
   type Envoy,
@@ -33,10 +33,44 @@ export function definiteRejection(error: unknown): boolean {
     Number(value.status ?? value.statusCode),
   );
 }
-const POLICY = `You are an Envoy: complete the user's bounded task in this workspace. Delegate work to available specialists when their role fits; specialist_handoff creates a child in this workspace, so brief it with the goal, ownership, constraints and verification. Keep the user informed and report results and verification in this thread. Do not claim task completion from an idle agent or CI alone.
-All pull requests you open must be DRAFT (gh pr create --draft). Immediately after opening a PR, call envoy_attach_pr with its exact GitHub URL; also attach an existing PR only when it belongs to this task. Sages watches only attached PRs. Never mark a PR ready unless the user explicitly asks. The user may also mark it ready directly on GitHub. Once ready, Sages automatically invokes the mandatory pr-handoff specialist for its existing CI and review-reminder procedure; do not launch a duplicate pr-handoff yourself. No PR attached means no PR polling. Envoy delegation is authorized within this task.`;
+/** The user's Envoy settings; every external convention is opt-in. */
+export type EnvoyConfig = {
+  /** Projects whose base checkout is fast-forwarded before each new Envoy. */
+  preparedProjects: string[];
+  /** Run in a prepared base checkout, and asked of each new worktree. */
+  installCommand: string;
+  /** The specialist started when an attached PR is ready; "" for none. */
+  handoffSpecialist: string;
+  /** Extra instructions sent to that specialist with the PR. */
+  handoffInstructions: string;
+  /** Hostnames allowed for issue links; empty allows any. */
+  issueHosts: string[];
+};
+export const defaultEnvoyConfig: EnvoyConfig = {
+  preparedProjects: [],
+  installCommand: "",
+  handoffSpecialist: "",
+  handoffInstructions: "",
+  issueHosts: [],
+};
 
-export async function registerEnvoys(bb: BbPluginApi) {
+function policy(handoff: string) {
+  return `You are an Envoy: complete the user's bounded task in this workspace. Delegate work to available specialists when their role fits; specialist_handoff creates a child in this workspace, so brief it with the goal, ownership, constraints and verification. Keep the user informed and report results and verification in this thread. Do not claim task completion from an idle agent or CI alone.
+All pull requests you open must be DRAFT (gh pr create --draft). Immediately after opening a PR, call envoy_attach_pr with its exact GitHub URL; also attach an existing PR only when it belongs to this task. Never mark a PR ready unless the user explicitly asks. ${
+    handoff
+      ? `Sages watches only attached PRs: once one is marked ready (by you on request, or by the user on GitHub), it starts the ${handoff} specialist for follow-up; do not start ${handoff} for that PR yourself.`
+      : "No ready-for-review follow-up is configured, so Sages does not poll PRs."
+  } Envoy delegation is authorized within this task.`;
+}
+
+export async function registerEnvoys(
+  bb: BbPluginApi,
+  config: () => Promise<EnvoyConfig> = async () => defaultEnvoyConfig,
+) {
+  // configure() is synchronous, so it uses the settings as last read.
+  let lastConfig = defaultEnvoyConfig;
+  const read = async () => (lastConfig = await config());
+  await read();
   const db = bb.storage.database();
   db.exec(
     "CREATE TABLE IF NOT EXISTS envoys (id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, data TEXT NOT NULL, launch TEXT NOT NULL)",
@@ -197,10 +231,11 @@ export async function registerEnvoys(bb: BbPluginApi) {
       lead: Specialist | null;
     };
     const available = await specialists();
-    const context = [
-      POLICY,
+    const settings = await read();
+    let context = [
+      policy(settings.handoffSpecialist),
       available === null
-        ? "Specialists are unavailable; report this limitation when delegation is needed. A missing pr-handoff must be surfaced, never skipped."
+        ? "Specialists are unavailable; report this limitation when delegation is needed."
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
       ...(launch.lead ? [launch.lead.prompt] : []),
     ].join("\n\n");
@@ -239,6 +274,42 @@ export async function registerEnvoys(bb: BbPluginApi) {
       sources.reasoningLevel = "explicit";
     }
     execution.executionInputSources = sources;
+    // Preparation failures cannot have spawned a thread and are safe to retry.
+    // Keep this outside the ambiguous-spawn handling below.
+    try {
+      if (settings.preparedProjects.includes(envoy.projectId)) {
+        const selection = execution.environment;
+        let hostId: string | undefined;
+        if (selection.type === "host" && selection.workspace.type === "managed-worktree" && selection.workspace.baseBranch.kind === "default") {
+          hostId = selection.hostId;
+        } else if (selection.type === "provider" && selection.environmentProviderId === "git-worktree") {
+          z.object({ branch: z.object({ kind: z.literal("default") }).optional() }).strict().parse(selection.inputs ?? {});
+          if (selection.machine?.type === "new") throw new Error("Prepared sources require an existing machine");
+          hostId = selection.machine?.hostId;
+        } else {
+          throw new Error("Prepared projects require a new worktree from the default branch");
+        }
+        const project = await bb.sdk.projects.get({ projectId: envoy.projectId });
+        const candidates = project.sources.filter((source) => !hostId || source.hostId === hostId);
+        const source = candidates.find((source) => source.isDefault) ?? (candidates.length === 1 ? candidates[0] : undefined);
+        if (!source) throw new Error("Select a machine with an unambiguous project source");
+        update(id, { error: `Preparing source: ${source.path}` });
+        const prepared = await host.call("prepareSource", { path: source.path, installCommand: settings.installCommand }, {
+          hostId: source.hostId, signal: controller.signal, timeoutMs: 20 * 60_000,
+        });
+        execution.environment = {
+          type: "host", hostId: source.hostId,
+          workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: prepared.commit } },
+        };
+        context += `\n\nSource prepared at ${prepared.commit} (${prepared.branch}).${
+          settings.installCommand.trim()
+            ? ` Dependencies were installed in the base checkout with \`${settings.installCommand}\`. The new worktree has its own dependency state: before editing or validating, follow the repository's worktree setup instructions and run \`${settings.installCommand}\` in this workspace. Stop and report installation failures; do not link the base checkout's dependencies.`
+            : " Before editing or validating, follow the repository's worktree setup instructions."
+        }`;
+      }
+    } catch (error) {
+      return update(id, { creation: "failed", error: `Source preparation failed: ${errorText(error)}` });
+    }
     update(id, { creation: "launching", error: null });
     try {
       const thread = await bb.sdk.threads.spawn({
@@ -257,7 +328,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
             ? [
                 {
                   type: "text" as const,
-                  text: `Linked Linear issue: ${envoy.issue.key}\n${envoy.issue.url}`,
+                  text: `Linked issue: ${envoy.issue.key}\n${envoy.issue.url}`,
                   mentions: [],
                 },
               ]
@@ -304,7 +375,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
         throw new Error("Provide a task directive of 1–100,000 characters");
       if (JSON.stringify(input.request).length > 200_000)
         throw new Error("The task request is too large");
-      const issue = linearIssue(input.issueUrl);
+      const issue = issueLink(input.issueUrl, (await read()).issueHosts);
       const available = input.specialist ? await specialists() : null;
       const lead = input.specialist
         ? available?.find((s) => s.name === input.specialist)
@@ -529,7 +600,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
           {
             ...identity,
             state: "unknown",
-            watching: true,
+            watching: (await read()).handoffSpecialist !== "",
             handoffKey: `envoy-pr:${id}:${identity.owner}/${identity.repo}:${identity.number}`,
             handoff: "pending",
             handoffThreadId: null,
@@ -589,6 +660,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
     if (watching || disposed || !eligible()) return;
     watching = true;
     try {
+      const settings = await read();
       for (const envoy of [...records.values()]) {
         if (!envoy.threadId || envoy.lifecycle === "cancelled") continue;
         for (const candidate of envoy.prs.filter(
@@ -607,6 +679,11 @@ export async function registerEnvoys(bb: BbPluginApi) {
               (readRetries.get(pr.handoffKey)?.after ?? 0) > Date.now()
             )
               return;
+            // Without a ready-PR handoff there is nothing to watch for.
+            if (!settings.handoffSpecialist) {
+              updatePr(current.id, pr.url, { watching: false });
+              return;
+            }
             let readCompleted = false;
             try {
               const thread = await bb.sdk.threads.get({
@@ -655,9 +732,10 @@ export async function registerEnvoys(bb: BbPluginApi) {
                 });
                 return;
               }
-              if (!(await specialists())?.some((s) => s.name === "pr-handoff"))
+              const handoff = settings.handoffSpecialist;
+              if (!(await specialists())?.some((s) => s.name === handoff))
                 throw new Error(
-                  "The pr-handoff specialist is unavailable; restore it and retry the handoff",
+                  `The ${handoff} specialist is unavailable; restore it or change the ready-PR handoff setting, then retry the handoff`,
                 );
               updatePr(current.id, pr.url, {
                 handoff: "dispatching",
@@ -689,8 +767,13 @@ export async function registerEnvoys(bb: BbPluginApi) {
                 pluginId: "specialists",
                 method: "specialists_handoff_keyed",
                 input: {
-                  specialist: "pr-handoff",
-                  task: `This Envoy PR is ready for review: ${pr.url}\nObserved head: ${state.head}\nOrigin thread: ${current.threadId}\nRun your existing required-CI and six-hour required-team review-reminder procedure, including its authorized CI retries and one-shot Slack reminder. Resolve actual requirements and timestamps; don't start the review clock during draft time. Report CI and reminder state separately. Do not create another readiness watcher.`,
+                  specialist: handoff,
+                  task: [
+                    `This Envoy PR is ready for review: ${pr.url}\nObserved head: ${state.head}\nOrigin thread: ${current.threadId}\nFollow your procedure for a PR that is ready for review and report the outcome. Do not create another readiness watcher.`,
+                    settings.handoffInstructions.trim(),
+                  ]
+                    .filter(Boolean)
+                    .join("\n\n"),
                   projectId: current.projectId,
                   environmentId: thread.environmentId,
                   requestedBy: `Envoy ${current.name}`,
@@ -814,7 +897,9 @@ export async function registerEnvoys(bb: BbPluginApi) {
       serial(id, async () => {
         const envoy = get(id);
         const issue =
-          issueUrl === undefined ? envoy.issue : linearIssue(issueUrl);
+          issueUrl === undefined
+            ? envoy.issue
+            : issueLink(issueUrl, (await read()).issueHosts);
         if (name && envoy.threadId)
           await bb.sdk.threads.update({
             threadId: envoy.threadId,
@@ -848,7 +933,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: PR_TOOL,
     description:
-      "Attach this Envoy's GitHub PR to activate ready-for-review monitoring. Required immediately after opening a draft PR. It does not mark the PR ready.",
+      "Attach this Envoy's GitHub PR so Sages tracks it, and watches for it to be marked ready when a ready-PR handoff is configured. Required immediately after opening a draft PR. It does not mark the PR ready.",
     parameters: z.object({ url: z.string().max(2000) }),
     execute: async ({ url }, { threadId }) => {
       const envoy = [...records.values()].find((e) => e.threadId === threadId);
@@ -858,7 +943,8 @@ export async function registerEnvoys(bb: BbPluginApi) {
         );
       const updated = await prAction(envoy.id, url, "attach");
       const pr = updated.prs.find((p) => p.url === githubPr(url).url)!;
-      return `Attached ${pr.url}. ${pr.watching ? "Ready-for-review monitoring is active; pr-handoff starts when you or the user marks it ready." : pr.handoff === "started" ? "PR handoff has already started." : "PR follow-up is paused; use Retry in Envoy details."}`;
+      const { handoffSpecialist } = await read();
+      return `Attached ${pr.url}. ${pr.watching ? `Ready-for-review monitoring is active; ${handoffSpecialist} starts when you or the user marks it ready.` : pr.handoff === "started" ? "PR handoff has already started." : handoffSpecialist ? "PR follow-up is paused; use Retry in Envoy details." : "No ready-PR handoff is configured, so it is not watched."}`;
     },
   });
   // Startup recovery and checking are dormant until actual records need work.
@@ -959,7 +1045,7 @@ export async function registerEnvoys(bb: BbPluginApi) {
       const envoy = records.get(String(context.pluginMetadata.envoyId ?? ""));
       return envoy &&
         (envoy.threadId === null || envoy.threadId === context.thread.id)
-        ? { tools: [PR_TOOL], skills: [], instructions: POLICY }
+        ? { tools: [PR_TOOL], skills: [], instructions: policy(lastConfig.handoffSpecialist) }
         : { tools: [], skills: [] };
     },
     async runCli(argv: string[], ctx: PluginCliContext) {

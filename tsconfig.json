@@ -24,6 +24,8 @@
   "include": [
     "server.ts",
     "envoys.ts",
+    "harness.ts",
+    "harness.test.ts",
     "envoy-contract.ts",
     "envoys-app.tsx",
     "envoys.test.ts",
@@ -34,6 +36,7 @@
     "app.tsx",
     "components",
     "lib",
-    "hooks"
+    "hooks",
+    "source-preparation.test.ts"
   ]
 }

@@ -7,11 +7,11 @@ import {
   makeMessageDispatchHookContext,
 } from "@get-bb/plugin-sdk/testing";
 import { registerEnvoys } from "./envoys.ts";
-import { githubPr, linearIssue } from "./envoy-contract.ts";
+import { githubPr, issueLink } from "./envoy-contract.ts";
 
 const specialist = {
-  name: "pr-handoff",
-  description: "CI and review reminders",
+  name: "ready-pr",
+  description: "Follows up on ready PRs",
   prompt: "Monitor the PR",
   providerId: null,
   model: null,
@@ -20,7 +20,7 @@ const specialist = {
 const request = {
   requestId: "request-1",
   name: "",
-  issueUrl: "https://linear.app/wallet/issue/WAL-123/fix",
+  issueUrl: "https://tracker.example.com/team/issue/ABC-123/fix",
   specialist: null,
   request: {
     projectId: "project-1",
@@ -28,7 +28,7 @@ const request = {
       type: "host",
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     },
-    input: [{ type: "text", text: "Fix saved-swap crash", mentions: [] }],
+    input: [{ type: "text", text: "Fix login crash", mentions: [] }],
     permissionMode: "accept-edits",
   },
 };
@@ -42,6 +42,9 @@ async function setup(
     hostError?: boolean;
     uncertainHandoff?: boolean;
     lead?: boolean;
+    prepare?: boolean;
+    noHandoff?: boolean;
+    issueHosts?: string[];
   } = {},
 ) {
   let state = "draft";
@@ -52,14 +55,16 @@ async function setup(
   const { bb, harness } = createFakePluginHost({
     pluginId: "sages",
     experimental_hostEntry: true,
-    experimental_callHostRpc: async () => {
+    experimental_callHostRpc: async ({ method }) => {
       if (options.hostError) throw new Error("Host temporarily offline");
+      if (method === "prepareSource") return { commit: "a".repeat(40), branch: "main" };
       return { state, head: "head-1" };
     },
     sdk: {
       projects: {
+        get: async () => ({ id: "project-1", sources: [{ hostId: "host-1", path: "/repo/base", isDefault: true }] }),
         list: async () => [
-          { id: "project-1", name: "Wallet", kind: "standard" },
+          { id: "project-1", name: "Example", kind: "standard" },
         ],
       },
       environments: {
@@ -170,7 +175,13 @@ async function setup(
       },
     },
   });
-  const helpers = await registerEnvoys(bb);
+  const helpers = await registerEnvoys(bb, async () => ({
+    preparedProjects: options.prepare ? ["project-1"] : [],
+    installCommand: "npm ci",
+    handoffSpecialist: options.noHandoff ? "" : "ready-pr",
+    handoffInstructions: "Check CI, then remind reviewers.",
+    issueHosts: options.issueHosts ?? [],
+  }));
   async function sweep() {
     const service = harness.behavior.runService("envoy-recovery");
     await service.done;
@@ -195,18 +206,50 @@ async function setup(
 
 test("URLs are explicit provider identities, not branch inference or arbitrary endpoints", () => {
   assert.equal(
-    linearIssue("https://linear.app/wallet/issue/WAL-123/fix?x=1")?.key,
-    "WAL-123",
+    issueLink("https://tracker.example.com/team/issue/ABC-123/fix?x=1")?.key,
+    "ABC-123",
   );
-  assert.equal(linearIssue(""), null);
-  assert.throws(() => linearIssue("https://evil.test/wallet/issue/WAL-123"));
+  assert.equal(
+    issueLink("https://github.com/owner/repo/issues/42")?.key,
+    "#42",
+  );
+  assert.equal(issueLink(""), null);
+  assert.throws(() => issueLink("http://tracker.example.com/issue/ABC-123"));
   assert.throws(() =>
-    linearIssue("https://linear.app@evil.test/wallet/issue/WAL-123"),
+    issueLink("https://evil.test/team/issue/ABC-123", ["tracker.example.com"]),
+  );
+  assert.throws(() =>
+    issueLink("https://tracker.example.com@evil.test/issue/ABC-123", [
+      "tracker.example.com",
+    ]),
   );
   assert.throws(() =>
     githubPr("https://github.com/owner/repo/pull/1/../../issues/2"),
   );
   assert.equal(githubPr("https://github.com/owner/repo/pull/123").number, 123);
+});
+
+test("without a ready-PR handoff, attached PRs are recorded but never polled", async () => {
+  const s = await setup({ noHandoff: true, issueHosts: ["tracker.example.com"] });
+  try {
+    const envoy = await s.create();
+    assert.equal(envoy.issue.key, "ABC-123");
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as any;
+    assert.match(spawn.input[0].text, /Sages does not poll PRs/);
+    assert.doesNotMatch(spawn.input[0].text, /starts the ready-pr specialist/);
+    const attached = (await s.harness.behavior.callRpc("envoys_pr", {
+      id: envoy.id,
+      url: "https://github.com/owner/repo/pull/123",
+      action: "attach",
+    })) as any;
+    assert.equal(attached.prs[0].watching, false);
+    s.setState("ready");
+    await s.sweep();
+    assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 0);
+    assert.equal(s.counts().handoffCount, 0);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
 });
 
 test("ordinary lead, generated name, stable visible thread, preserved permissions and double-submit dedup", async () => {
@@ -215,7 +258,7 @@ test("ordinary lead, generated name, stable visible thread, preserved permission
     const [a, b] = await Promise.all([s.create(), s.create()]);
     assert.equal(a.id, b.id);
     assert.equal(s.counts().spawnCount, 1);
-    assert.equal(a.name, "Fix saved-swap crash");
+    assert.equal(a.name, "Fix login crash");
     assert.equal(a.specialist, null);
     const spawn = s.harness.inspection.sdk.callsTo(
       "threads.spawn",
@@ -224,7 +267,7 @@ test("ordinary lead, generated name, stable visible thread, preserved permission
     assert.equal(spawn.permissionMode, "accept-edits");
     assert.equal(spawn.environment.workspace.type, "managed-worktree");
     assert.match(spawn.input[0].text, /DRAFT.*gh pr create --draft/);
-    assert.match(spawn.input[0].text, /pr-handoff/);
+    assert.match(spawn.input[0].text, /ready-pr specialist/);
     const plain = s.helpers.configure(makePluginAgentConfigurationContext());
     assert.deepEqual(plain.tools, []);
     const envoy = s.helpers.configure(
@@ -277,7 +320,8 @@ test("draft attachment activates reads, readiness triggers exactly one parented 
     assert.equal(handoff.input.parentThreadId, envoy.threadId);
     assert.equal(handoff.input.environmentId, "environment-1");
     assert.match(handoff.input.handoffKey, /envoy-pr:/);
-    assert.match(handoff.input.task, /six-hour/);
+    assert.equal(handoff.input.specialist, "ready-pr");
+    assert.match(handoff.input.task, /Check CI, then remind reviewers\./);
     await s.harness.behavior.callRpc("envoys_pr", {
       id: envoy.id,
       url,
@@ -462,7 +506,7 @@ test("missing mandatory specialist is surfaced and a parked Envoy is not restart
     const stored = (await s.harness.behavior.callRpc("envoys_get", {
       threadId: envoy.threadId,
     })) as any;
-    assert.match(stored.prs[0].error, /pr-handoff specialist is unavailable/);
+    assert.match(stored.prs[0].error, /ready-pr specialist is unavailable/);
     assert.equal(s.harness.inspection.sdk.callsTo("threads.send").length, 0);
     assert.equal(s.counts().handoffCount, 0);
   } finally {
@@ -626,7 +670,7 @@ test("lead defaults apply with provenance, while explicit selections and workspa
       await s.harness.behavior.callRpc("envoys_create", {
         ...request,
         requestId: `lead-${explicit}`,
-        specialist: "pr-handoff",
+        specialist: "ready-pr",
         request: {
           ...request.request,
           providerId: "codex",
@@ -750,4 +794,54 @@ test("read-only host failures recover automatically after backoff without a Retr
     Date.now = realNow;
     await s.harness.lifecycle.dispose();
   }
+});
+
+test("prepared projects pin a fresh worktree and never spawn when preparation fails", async () => {
+  const s = await setup({ prepare: true, hostError: true });
+  try {
+    const failed = await s.create();
+    assert.equal(failed.creation, "failed");
+    assert.match(failed.error, /Source preparation failed/);
+    assert.equal(s.counts().spawnCount, 0);
+    s.options.hostError = false;
+    const ready = await s.create();
+    assert.equal(ready.id, failed.id);
+    assert.equal(ready.creation, "ready");
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as any;
+    assert.deepEqual(spawn.environment, {
+      type: "host", hostId: "host-1",
+      workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "a".repeat(40) } },
+    });
+    assert.match(spawn.input[0].text, /run `npm ci` in this workspace/);
+    assert.equal((s.harness.inspection.experimental_hostRpcCalls.at(-1) as any).input.installCommand, "npm ci");
+    await s.create();
+    assert.equal(s.counts().spawnCount, 1);
+  } finally { await s.harness.lifecycle.dispose(); }
+});
+
+test("prepared projects accept the native worktree picker but reject checkout reuse and branch overrides", async () => {
+  const s = await setup({ prepare: true });
+  try {
+    for (const environment of [
+      { type: "reuse", environmentId: "env-base" },
+      { type: "host", workspace: { type: "unmanaged", path: "/repo/base" } },
+      { type: "provider", environmentProviderId: "git-worktree", inputs: { kind: "existing", path: "/repo/base" } },
+      { type: "provider", environmentProviderId: "git-worktree", inputs: { branch: { kind: "named", name: "feature" } } },
+    ]) {
+      const failed = await s.harness.behavior.callRpc("envoys_create", {
+        ...request, request: { ...request.request, environment },
+      }) as any;
+      assert.equal(failed.creation, "failed");
+    }
+    assert.equal(s.counts().spawnCount, 0);
+    assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 0);
+    const ready = await s.harness.behavior.callRpc("envoys_create", {
+      ...request, request: { ...request.request, environment: {
+        type: "provider", environmentProviderId: "git-worktree", inputs: {},
+        machine: { type: "existing", hostId: "host-1" },
+      } },
+    }) as any;
+    assert.equal(ready.creation, "ready");
+    assert.equal(s.counts().spawnCount, 1);
+  } finally { await s.harness.lifecycle.dispose(); }
 });

@@ -33,6 +33,7 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { EnvoyList, registerEnvoyApp } from "./envoys-app";
+import { registerSettingsApp } from "./settings-app";
 
 const PANEL_PATH = "sages";
 
@@ -1464,6 +1465,7 @@ function SagesPage({ subPath }: PluginNavPanelProps) {
 
 export default definePluginApp((app) => {
   registerEnvoyApp(app);
+  registerSettingsApp(app);
   app.slots.navPanel({
     id: "sages",
     title: "Sages",

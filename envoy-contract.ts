@@ -9,26 +9,30 @@ export const lifecycleSchema = z.enum([
   "cancelled",
 ]);
 export const issueSchema = z.object({ key: z.string(), url: z.string() });
-export function linearIssue(raw: string) {
+/** An issue link on any tracker; `hosts`, when given, restricts its hostname. */
+export function issueLink(raw: string, hosts: string[] = []) {
   if (!raw.trim()) return null;
   const url = new URL(raw.trim());
-  const match = /^\/[^/]+\/issue\/([A-Z][A-Z0-9]*-\d+)(?:\/[^/]*)?\/?$/u.exec(
-    url.pathname,
-  );
   if (
     url.protocol !== "https:" ||
-    url.hostname !== "linear.app" ||
     url.username ||
     url.password ||
     url.port ||
-    !match
+    (hosts.length > 0 && !hosts.includes(url.hostname))
   )
     throw new Error(
-      "Use a full https://linear.app/<workspace>/issue/ABC-123 URL",
+      hosts.length > 0
+        ? `Use a full https:// issue URL on ${hosts.join(", ")}`
+        : "Use a full https:// issue URL",
     );
   url.search = "";
   url.hash = "";
-  return { key: match[1]!, url: url.toString() };
+  // A tracker key (ABC-123) when the path has one, else a trailing number.
+  const number = /\/(\d+)\/?$/u.exec(url.pathname)?.[1];
+  const key =
+    /\b[A-Z][A-Z0-9]*-\d+\b/u.exec(url.pathname)?.[0] ??
+    (number ? `#${number}` : url.hostname);
+  return { key, url: url.toString() };
 }
 export function githubPr(raw: string) {
   const url = new URL(raw.trim());
@@ -209,6 +213,10 @@ export const prStateSchema = z.object({
   head: z.string(),
 });
 export const envoyHostContract = defineRpcContract({
+  prepareSource: {
+    input: z.object({ path: z.string().min(1), installCommand: z.string() }),
+    output: z.object({ commit: z.string().regex(/^[a-f0-9]{40,64}$/u), branch: z.string().min(1) }),
+  },
   prState: {
     input: z.object({
       owner: z.string().regex(/^[\w.-]+$/u),

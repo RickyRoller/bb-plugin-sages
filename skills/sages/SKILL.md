@@ -53,13 +53,13 @@ with Envoy creation.
 
 - `bb sages envoy list [--json]` and `show <id>` inspect tasks. Use returned ids.
 - `bb sages envoy create --project <project-id> --task <directive>` starts work in
-  a fresh worktree. Optional: `--name`, `--issue` (full Linear issue URL),
+  a fresh worktree. Optional: `--name`, `--issue` (full https issue URL),
   `--specialist` (lead preset), `--request-id` (reuse for deduplication).
   Prefer the New Envoy UI when machine/model/permissions need selection.
 - `bb sages envoy park|resume|complete|cancel <id>` manages task lifecycle. Park
   preserves workspace/chat and PR follow-up. Complete preserves PR follow-up;
-  cancel stops attached readiness checks and handoff agents. Already-scheduled
-  reminders are managed separately in Automations. These commands do not delete files.
+  cancel stops attached readiness checks and handoff agents. These commands do not
+  delete files.
 - `bb sages envoy pr <id> <full-github-pr-url>` attaches an existing task PR.
   The primary Envoy agent can instead call `envoy_attach_pr` immediately after
   opening its draft PR. The details dialog can detach or retry the handoff.
@@ -68,11 +68,20 @@ with Envoy creation.
   launch can be relaunched; an unthreaded task can also be cancelled. Retry known agent or
   workspace failures in the native task thread.
 
+For a project listed in Sages' `envoyPreparedProjects` setting, use its dedicated
+base-checkout project ID in `--project`. Creation first fast-forwards the clean default
+branch and runs the configured `envoyInstallCommand`, if any, then creates a worktree
+at that exact commit. Preparation failures block launch; correct the
+cause and `recover`. Do not reset/stash the source or bypass preparation. New worktrees
+still need their own dependencies: follow repository setup instructions and the
+Envoy's launch instructions before editing or validating. Other projects use native BB setup.
+
 Use specialists for appropriate work; a specialist lead is optional. All new PRs
 must open as drafts. Never mark ready without the user's explicit request. Only
-attached Envoy PRs are polled; readiness automatically starts the mandatory
-`pr-handoff` specialist. Do not start another handoff worker manually. If that
-specialist is unavailable, report the error and restore/retry it. Read-only host failures retry with backoff; handoff
+attached Envoy PRs are polled, and only when a Ready-PR handoff specialist is
+chosen in the Sages settings: readiness then starts it automatically. Do not start
+another handoff worker manually. If that specialist is unavailable, report the
+error so the user can restore it or change the setting, then retry. Read-only host failures retry with backoff; handoff
 errors pause polling until Retry. Specialists must support keyed handoff version 1;
 older versions are rejected before dispatch. `gh` must be
 installed and authenticated on the task workspace's machine.
