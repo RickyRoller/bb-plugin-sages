@@ -10,13 +10,14 @@ import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
-import { registerEnvoys } from "./envoys.ts";
+import { ENVOY_USAGE, registerEnvoys } from "./envoys.ts";
 import { MissingCli, runDirect } from "./harness.ts";
 import {
   COMPACTION_PROMPT,
   HANDOFF_PROMPT,
   ACOLYTE_PROMPT,
   ACOLYTE_SUMMARY_PROMPT,
+  ENVOY_PROMPT,
   TURN_PROMPT,
 } from "./prompts";
 
@@ -198,6 +199,8 @@ const ZOOM_TOOL = "sage_zoom";
 const DATE_TOOL = "sage_date";
 const HANDOFF_TOOL = "sage_handoff";
 const ACOLYTE_TOOL = "sage_acolyte";
+const MESSAGE_TOOL = "sage_message_acolyte";
+const ENVOY_TOOL = "sage_envoy";
 
 /** A specialist, as the Specialists plugin lists it. */
 const specialistSchema = z.looseObject({
@@ -730,7 +733,7 @@ export default async function plugin(bb: BbPluginApi) {
     const parent = findSage(sage.parentId);
     const acolyte = [
       `You are ${sage.name}, an acolyte of ${parent.name}: a sage under it, focused on ${sage.topic === "" ? "one part of its work" : sage.topic}. ${parent.name}'s chat comes first, inside <main> tags, then your own view.`,
-      `Both are your memory: zoom ${parent.name}'s with "main". Keep to your focus, and you cannot open acolytes. When a piece of work is done, say so: the user may go on here, or close this chat and send its summary to ${parent.name}.`,
+      `Both are your memory: zoom ${parent.name}'s with "main". Keep to your focus, and you cannot open acolytes. When a piece of work is done, say so: the user may go on here, or close this chat and send its summary to ${parent.name}. A message starting "[acolyte of ${parent.name}] message" is from ${parent.name} itself: your last reply in that turn goes back to it, so end with what it asked for.`,
       parent.instructions === ""
         ? null
         : `\n# ${parent.name}'s instructions, which you follow too\n${parent.instructions}`,
@@ -1348,6 +1351,152 @@ export default async function plugin(bb: BbPluginApi) {
         ].join("\n");
       }),
   });
+  bb.agents.registerTool({
+    name: MESSAGE_TOOL,
+    description:
+      'Send a message to one of your open acolytes. It works on it in its own chat, and its reply reaches this chat as a message starting "[acolyte". Never wait for it.',
+    presentation: {
+      label: { pending: "Messaging acolyte", completed: "Messaged acolyte" },
+    },
+    parameters: z.object({
+      acolyte: z
+        .string()
+        .trim()
+        .min(1)
+        .describe("The acolyte's id or name, as listed after the view"),
+      message: z
+        .string()
+        .trim()
+        .min(1)
+        .max(30_000)
+        .describe(
+          "What to do or answer, and what to send back. It has your memory, so refer to the chat freely.",
+        ),
+    }),
+    execute: ({ acolyte: which, message }, { threadId }) =>
+      toolResult(async () => {
+        const sage = await sageOfTurn(threadId);
+        const key = which.toLowerCase();
+        const acolyte = sages.find(
+          (each) =>
+            each.parentId === sage.id &&
+            each.archivedAt === null &&
+            (each.id === which || each.name.toLowerCase() === key),
+        );
+        if (acolyte === undefined)
+          throw new Error(
+            `${sage.name} has no open acolyte "${which}"; your acolytes are listed after the view`,
+          );
+        if (acolyte.defaults === null) {
+          // An acolyte that has never run works where its lead's turn does.
+          const turn = await bb.sdk.threads.get({ threadId });
+          await updateSage(acolyte.id, {
+            defaults: {
+              ...sage.defaults,
+              projectId: turn.projectId,
+              ...(turn.environmentId
+                ? {
+                    environment: {
+                      type: "reuse",
+                      environmentId: turn.environmentId,
+                    },
+                  }
+                : {}),
+            },
+          });
+        }
+        await serial(acolyte.id, () =>
+          deliver(
+            acolyte.id,
+            threadId,
+            `Message from ${sage.name}`,
+            `[acolyte of ${sage.name}] message:\n\n${message}`,
+            "acolyte",
+          ),
+        );
+        // Its reply comes back like a specialist's report, when the turn
+        // the message started or joined goes idle.
+        const turn = findSage(acolyte.id).threadId;
+        if (turn !== null) {
+          workers.set(turn, {
+            sageId: sage.id,
+            specialist: `acolyte ${acolyte.name}`,
+          });
+          await saveWorkers();
+        }
+        return `Sent to "${acolyte.name}" (acolyte ${acolyte.id}). Its reply reaches this chat as a message starting "[acolyte ${acolyte.name}]". Do not wait for it or do its work meanwhile.`;
+      }),
+  });
+  bb.agents.registerTool({
+    name: ENVOY_TOOL,
+    description:
+      "Start an Envoy: a bounded task in a fresh worktree from the project's default branch, run by an agent in one visible bb thread that opens draft PRs. Only when the user or your instructions call for one.",
+    instructions: ENVOY_PROMPT,
+    presentation: {
+      label: { pending: "Starting Envoy", completed: "Started Envoy" },
+    },
+    parameters: z.object({
+      task: z
+        .string()
+        .trim()
+        .min(1)
+        .max(100_000)
+        .describe(
+          "The directive. It sees none of this chat: the goal, relevant paths and facts, constraints, how to verify it, and what done looks like. Its first line names the task unless name is given.",
+        ),
+      project: z
+        .string()
+        .trim()
+        .optional()
+        .describe(
+          "The project's id or name; this turn's project when left out",
+        ),
+      name: z.string().trim().max(80).optional(),
+      issueUrl: z.string().trim().max(2000).optional().describe("A full https issue link"),
+      specialist: z
+        .string()
+        .trim()
+        .optional()
+        .describe("A specialist to lead it, from the list after the view"),
+      requestId: z
+        .string()
+        .trim()
+        .max(100)
+        .optional()
+        .describe("Reuse to make a retried call return the same Envoy"),
+    }),
+    execute: ({ task, project, name, issueUrl, specialist, requestId }, { threadId }) =>
+      toolResult(async () => {
+        await sageOfTurn(threadId);
+        let projectId = (await bb.sdk.threads.get({ threadId })).projectId;
+        if (project) {
+          const projects = await bb.sdk.projects.list({ includePersonal: true });
+          const key = project.toLowerCase();
+          const match =
+            projects.find((each) => each.id === project) ??
+            projects.find((each) => each.name.toLowerCase() === key);
+          if (match === undefined)
+            throw new Error(
+              `No project "${project}". Projects: ${projects.map((each) => `${each.name} (${each.id})`).join(", ")}`,
+            );
+          projectId = match.id;
+        }
+        const envoy = await envoys.createTask({
+          task,
+          projectId,
+          name,
+          issueUrl,
+          specialist,
+          requestId,
+        });
+        return [
+          `Envoy "${envoy.name}" (${envoy.id}): creation ${envoy.creation}${envoy.error ? ` — ${envoy.error}` : ""}.`,
+          envoy.threadId === null
+            ? `No thread yet; check it with bb sages envoy show ${envoy.id}, and recover with bb sages envoy recover ${envoy.id}.`
+            : `Its thread: @thread:${envoy.threadId}. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
+        ].join("\n");
+      }),
+  });
   // A thread is a sage's turn when its metadata names a sage. The metadata
   // is writable by any client; all it unlocks is reading that sage's chat.
   bb.agents.configure((context) => {
@@ -1362,8 +1511,8 @@ export default async function plugin(bb: BbPluginApi) {
       : {
           tools:
             sage.parentId === null
-              ? [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL, ACOLYTE_TOOL]
-              : [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL],
+              ? [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL, ACOLYTE_TOOL, MESSAGE_TOOL, ENVOY_TOOL]
+              : [ZOOM_TOOL, DATE_TOOL, HANDOFF_TOOL, ENVOY_TOOL],
           skills: [],
           instructions: sageInstructions(sage),
         };
@@ -1383,7 +1532,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
     "  bb sages lead <sage-id> <lead-sage-id|none> [--json]",
     "  bb sages remove <sage-id> [--json]",
-    "  bb sages envoy list|show|create|recover|park|resume|complete|cancel|pr [--json]",
+    ...ENVOY_USAGE.split("\n").slice(1),
   ].join("\n");
   function formatSage(sage: Sage): string {
     const topic = sage.topic === "" ? "" : `  — ${sage.topic}`;
@@ -1393,7 +1542,7 @@ export default async function plugin(bb: BbPluginApi) {
     name: "sages",
     summary: "Manage sages: tuned chats bound to a topic or project",
     commands: [
-      { name: "envoy", summary: "Create and manage task workspaces (Envoys)", usage: "bb sages envoy list|show|create|recover|park|resume|complete|cancel|pr [--json]" },
+      { name: "envoy", summary: "Create and manage task workspaces (Envoys)", usage: ENVOY_USAGE },
       { name: "list", summary: "List sages", usage: "bb sages list [--json]" },
       {
         name: "show",

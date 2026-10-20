@@ -845,3 +845,34 @@ test("prepared projects accept the native worktree picker but reject checkout re
     assert.equal(s.counts().spawnCount, 1);
   } finally { await s.harness.lifecycle.dispose(); }
 });
+
+test("the CLI documents create's flags and creates through the shared task path", async () => {
+  const s = await setup();
+  try {
+    const ctx = { projectId: "project-1" } as any;
+    for (const argv of [[], ["--help"], ["create", "--help"]]) {
+      const help = await s.helpers.runCli(argv, ctx);
+      assert.equal(help.exitCode, 0);
+      assert.match(help.stdout!, /create --task <text> \[--project <project-id>\]/);
+    }
+    const created = await s.helpers.runCli(
+      ["create", "--task", "Fix login crash", "--request-id", "cli-1", "--json"],
+      ctx,
+    );
+    assert.equal(created.exitCode, 0);
+    const envoy = JSON.parse(created.stdout!);
+    assert.equal(envoy.projectId, "project-1");
+    assert.equal(envoy.name, "Fix login crash");
+    const again = await s.helpers.createTask({
+      task: "Fix login crash",
+      projectId: "project-1",
+      requestId: "cli-1",
+    });
+    assert.equal(again.id, envoy.id);
+    assert.equal(s.counts().spawnCount, 1);
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as any;
+    assert.equal(spawn.environment.workspace.type, "managed-worktree");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});

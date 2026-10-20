@@ -21,6 +21,30 @@ import {
 } from "./envoy-contract.ts";
 
 const PR_TOOL = "envoy_attach_pr";
+export const ENVOY_USAGE = [
+  "Usage:",
+  "  bb sages envoy list [--json]",
+  "  bb sages envoy show <id> [--json]",
+  "  bb sages envoy create --task <text> [--project <project-id>] [--name <name>] [--issue <url>] [--specialist <name>] [--request-id <key>] [--json]",
+  "  bb sages envoy park|resume|complete|cancel <id> [--json]",
+  "  bb sages envoy pr <id> <github-pr-url> [--json]",
+  "  bb sages envoy recover <id> [--json]",
+  "",
+  "create starts the task in a fresh worktree from the project's default branch,",
+  "with one visible bb thread. --project defaults to the current project; get ids",
+  "from bb project list. --issue is a full https issue link. --specialist names a",
+  "specialist to lead it. Reuse --request-id to make a retried create a no-op.",
+].join("\n");
+
+/** What an Envoy is created from outside its dialog: the CLI and sage turns. */
+export type EnvoyTask = {
+  task: string;
+  projectId: string;
+  name?: string;
+  issueUrl?: string;
+  specialist?: string;
+  requestId?: string;
+};
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 // Only structured validation/rejection responses establish that no spawn committed.
@@ -415,6 +439,28 @@ export async function registerEnvoys(
       // Provisioning/startup is owned by BB; creation does not wait for a turn.
       return serial(envoy.id, () => launch(envoy.id));
     });
+  }
+  /** Creates an Envoy in a fresh worktree from the default branch. */
+  function createTask(task: EnvoyTask) {
+    return create(
+      createSchema.parse({
+        requestId: task.requestId ?? randomUUID(),
+        name: task.name,
+        issueUrl: task.issueUrl,
+        specialist: task.specialist,
+        request: {
+          projectId: task.projectId,
+          input: [{ type: "text", text: task.task, mentions: [] }],
+          environment: {
+            type: "host",
+            workspace: {
+              type: "managed-worktree",
+              baseBranch: { kind: "default" },
+            },
+          },
+        },
+      }),
+    );
   }
   async function stopImplementation(envoy: Envoy, preserveHandoffs = true) {
     if (!envoy.threadId) return;
@@ -1041,6 +1087,7 @@ export async function registerEnvoys(
   });
 
   return {
+    createTask,
     configure(context: PluginAgentConfigurationContext) {
       const envoy = records.get(String(context.pluginMetadata.envoyId ?? ""));
       return envoy &&
@@ -1051,6 +1098,12 @@ export async function registerEnvoys(
     async runCli(argv: string[], ctx: PluginCliContext) {
       try {
         const [command, id, ...rest] = argv;
+        if (
+          command === undefined ||
+          argv.includes("--help") ||
+          argv.includes("-h")
+        )
+          return { exitCode: 0, stdout: ENVOY_USAGE };
         let value: unknown;
         if (command === "list") value = [...records.values()];
         else if (command === "show" && id) value = get(id);
@@ -1084,31 +1137,16 @@ export async function registerEnvoys(
               );
             flags[args[i]!.slice(2)] = args[++i]!;
           }
-          value = await create(
-            createSchema.parse({
-              requestId: flags["request-id"] ?? randomUUID(),
-              name: flags.name,
-              issueUrl: flags.issue,
-              specialist: flags.specialist,
-              request: {
-                projectId: flags.project ?? ctx.projectId,
-                input: [{ type: "text", text: flags.task ?? "", mentions: [] }],
-                environment: {
-                  type: "host",
-                  workspace: {
-                    type: "managed-worktree",
-                    baseBranch: { kind: "default" },
-                  },
-                },
-              },
-            }),
-          );
+          value = await createTask({
+            task: flags.task ?? "",
+            projectId: flags.project ?? ctx.projectId ?? "",
+            name: flags.name,
+            issueUrl: flags.issue,
+            specialist: flags.specialist,
+            requestId: flags["request-id"],
+          });
         } else
-          return {
-            exitCode: 1,
-            stderr:
-              "Usage: bb sages envoy list|show <id>|create --task <text> --project <id> [--name <name>] [--issue <url>] [--specialist <name>] [--request-id <key>]|recover <id>|park <id>|resume <id>|complete <id>|cancel <id>|pr <id> <url> [--json]",
-          };
+          return { exitCode: 1, stderr: ENVOY_USAGE };
         return {
           exitCode: 0,
           stdout: JSON.stringify(

@@ -8,8 +8,8 @@ instructions, and one chat that never ends.
   the view, and the compactor. It knows nothing about BB.
 - `prompts.ts` — the turn and compaction prompts.
 - `server.ts` — the backend: sage records and their acolytes, turns, logging
-  of what a turn's thread does, the `sage_zoom`, `sage_date`, `sage_handoff`
-  and `sage_acolyte` tools, the compaction model
+  of what a turn's thread does, the `sage_zoom`, `sage_date`, `sage_handoff`,
+  `sage_acolyte`, `sage_message_acolyte` and `sage_envoy` tools, the compaction model
   call, RPC for the page, and the `bb sages` CLI.
 - `app.tsx` — the frontend: a **Sages** page in the left sidebar. Its root
   lists and creates sages; `/plugins/sages/sages/<sage-id>` is that sage's
@@ -86,6 +86,11 @@ A user message resumes parked or completed tasks. Cancelled tasks require Resume
 After resuming a cancelled task, open its handoff thread to resume a stopped worker.
 Anything a handoff worker scheduled elsewhere, such as automations, is managed there. These actions do not delete the workspace; cleanup remains a separate native BB action.
 
+A sage starts one with its `sage_envoy(task, project?, name?, issueUrl?,
+specialist?, requestId?)` tool, which takes a project id or name and creates
+through the same path as the CLI. `bb sages envoy --help` prints every command
+and flag.
+
 ```sh
 bb sages envoy create --project <id> --task 'Fix login crash' --issue https://tracker.example.com/issue/ABC-123
 bb sages envoy list --json
@@ -148,6 +153,11 @@ acolytes.
   one with the branch button on the lead's page, create one with a lead in the
   create form, or move an existing sage under a lead with the edit form or
   `bb sages lead <sage-id> <lead-id|none>`.
+- **Messaging.** The lead sends an open acolyte work or a question with
+  `sage_message_acolyte(acolyte, message)`. It runs in the acolyte's chat
+  (joining its running turn, if any; an acolyte that has never run works where
+  the lead's turn does), and the acolyte's last reply comes back to the lead
+  like a specialist's report, starting `[acolyte <name>]`.
 - **In the lead's chat.** Openings and moves are `acolyte` messages, shown as
   collapsible rows with the acolyte's status. Active acolytes also show as
   chips above the composer, are listed to the lead each turn, and appear under

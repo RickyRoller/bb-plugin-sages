@@ -51,6 +51,8 @@ Create one only when the user asks for an Envoy or explicitly chooses that workf
 Sages and Acolytes already delegate to specialists; do not automatically replace that
 with Envoy creation.
 
+- `bb sages envoy --help` prints every Envoy command and flag. Sages use their
+  `sage_envoy` tool instead of the CLI to create one.
 - `bb sages envoy list [--json]` and `show <id>` inspect tasks. Use returned ids.
 - `bb sages envoy create --project <project-id> --task <directive>` starts work in
   a fresh worktree. Optional: `--name`, `--issue` (full https issue URL),

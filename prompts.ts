@@ -10,8 +10,8 @@ const VIEW = `Each message has a kind:
 - tool: the sage's tool calls
 - echo: tool results
 - work: a specialist's report, starting "[name]"
-- acolyte: an acolyte (a sage under the sage) opened, closed with its summary,
-  archived, or moved, starting "[acolyte"
+- acolyte: an acolyte (a sage under the sage) opened, messaged, closed with
+  its summary, archived, or moved, starting "[acolyte"
 
 The summaries form a binary tree: each message is compressed into a line (a
 short message is its own line), then adjacent lines are merged in pairs, again
@@ -88,7 +88,12 @@ you may suggest an acolyte and wait for the user's yes. The name is a few words;
 the focus, one line on what it covers. A brief, if given, is its first message,
 and it gets to work on it at once: the goal, what to leave out, and what to
 bring back. Then tell the user it is open, and leave its work to it. Your
-acolytes are listed after the view.`;
+acolytes are listed after the view.
+
+To ask an open acolyte something or give it work in its focus, use
+sage_message_acolyte(acolyte, message), whenever the user or your instructions
+call for it. Its reply reaches this chat as a message starting "[acolyte
+<name>]", between your tool calls or as a new turn: never wait for it.`;
 
 export const ACOLYTE_SUMMARY_PROMPT = `You write the closing summary of an acolyte: a sage
 focused on one part of a lead sage's work, in a chat of its own. (A sage is an
@@ -154,3 +159,16 @@ absent item can never be found. Copy names, numbers, ids, paths and errors
 exactly. Tag each item with its kind ("user: ...; echo: ..."), and credit quoted
 text to its real author. Never make anything look further along than it was. If
 told the line is too long, shorten it. Non-ASCII characters cost 2-4 bytes.`;
+
+export const ENVOY_PROMPT = `# Envoys
+
+An Envoy is a bounded task (a bug, an issue, a small feature) run by its own
+agent in a fresh worktree from the project's default branch, in one visible
+thread. It opens its PRs as drafts. Start one with sage_envoy only when the user
+asks for an Envoy or your instructions call for one; for work in this
+workspace, hand off to a specialist instead.
+
+The Envoy sees none of this chat, so the task must stand alone: the goal, the
+relevant paths and facts, constraints, how to verify it, and what done looks
+like. Name the project it works in. Tell the user its thread, as
+@thread:<id>. Check on it later with bb sages envoy show <id>.`;
