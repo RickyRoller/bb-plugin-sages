@@ -72,12 +72,6 @@ export const prSchema = z.object({
   owner: z.string(),
   repo: z.string(),
   number: z.number().int().positive(),
-  state: z.enum(["unknown", "draft", "ready", "closed", "merged"]),
-  watching: z.boolean(),
-  handoffKey: z.string(),
-  handoff: z.enum(["pending", "dispatching", "started", "error"]),
-  handoffThreadId: z.string().nullable(),
-  error: z.string().nullable(),
 });
 export const envoySchema = z.object({
   id: z.string(),
@@ -189,7 +183,7 @@ export const envoyRpcContract = defineRpcContract({
     input: z.object({
       id: z.string(),
       url: z.string().max(2000),
-      action: z.enum(["attach", "detach", "retry", "relaunch", "stop"]),
+      action: z.enum(["attach", "detach"]),
     }),
     output: envoySchema,
   },
@@ -214,21 +208,9 @@ export const envoyRpcContract = defineRpcContract({
     }),
   },
 });
-export const prStateSchema = z.object({
-  state: z.enum(["draft", "ready", "closed", "merged"]),
-  head: z.string(),
-});
 export const envoyHostContract = defineRpcContract({
   prepareSource: {
     input: z.object({ path: z.string().min(1), installCommand: z.string() }),
     output: z.object({ commit: z.string().regex(/^[a-f0-9]{40,64}$/u), branch: z.string().min(1) }),
-  },
-  prState: {
-    input: z.object({
-      owner: z.string().regex(/^[\w.-]+$/u),
-      repo: z.string().regex(/^[\w.-]+$/u),
-      number: z.number().int().positive(),
-    }),
-    output: prStateSchema,
   },
 });

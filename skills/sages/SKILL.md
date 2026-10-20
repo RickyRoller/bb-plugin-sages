@@ -64,7 +64,7 @@ with Envoy creation.
   delete files.
 - `bb sages envoy pr <id> <full-github-pr-url>` attaches an existing task PR.
   The primary Envoy agent can instead call `envoy_attach_pr` immediately after
-  opening its draft PR. The details dialog can detach or retry the handoff.
+  opening its draft PR. The details dialog can detach a PR or watch it again.
 - `bb sages envoy recover <id>` finds an existing thread after an interrupted
   creation response; it does not resend ambiguous spawns. A definite rejected
   launch can be relaunched; an unthreaded task can also be cancelled. Retry known agent or
@@ -79,18 +79,16 @@ still need their own dependencies: follow repository setup instructions and the
 Envoy's launch instructions before editing or validating. Other projects use native BB setup.
 
 Use specialists for appropriate work; a specialist lead is optional. All new PRs
-must open as drafts. Never mark ready without the user's explicit request. Only
-attached Envoy PRs are polled, and only when a Ready-PR handoff specialist is
-chosen in the Sages settings: readiness then starts it automatically. Do not start
-another handoff worker manually. If that specialist is unavailable, report the
-error so the user can restore it or change the setting, then retry. Read-only host failures retry with backoff; handoff
-errors pause polling until Retry. Specialists must support keyed handoff version 1;
-older versions are rejected before dispatch. `gh` must be
-installed and authenticated on the task workspace's machine.
+must open as drafts. Never mark ready without the user's explicit request. The Envoy
+owns its PR end to end: when a Ready-PR handoff specialist is chosen in the Sages
+settings, attaching a PR creates a watcher automation owned by the Envoy
+(`Envoy PR watcher: <url>`). Once the PR is marked ready, the watcher messages the
+Envoy with `[PR ready] …` and deletes itself, and the Envoy hands the PR off itself
+with `specialist_handoff`. Do not hand off for it. With no specialist chosen, attached
+PRs get no watcher. `gh` must be installed and authenticated on the BB server's machine.
 
-Automated notices cannot resume parked/completed tasks; a user message resumes
-those tasks. Cancelled tasks require Resume. Resume a cancelled handoff worker
-from its own BB thread. Read-only readiness errors retry with backoff; handoff
-errors pause until Retry. For an unconfirmed handoff, ordinary Retry only
-recovers its original worker. The Envoy details UI offers a confirmed Relaunch
-handoff that searches again before permitting another spawn.
+Parking, cancelling, or archiving an Envoy deletes its watchers; resuming a parked
+Envoy recreates them. Automated messages cannot resume parked/completed tasks, except
+the `[PR ready]` message to a completed one; a user message resumes those tasks.
+Cancelled tasks require Resume. Parking keeps the Envoy's handoff worker running;
+cancelling stops it.

@@ -16,11 +16,27 @@ import {
   githubPr,
   taskName,
   type Envoy,
-  type EnvoyPr,
   type Specialist,
 } from "./envoy-contract.ts";
 
 const PR_TOOL = "envoy_attach_pr";
+const WATCHER_PREFIX = "Envoy PR watcher: ";
+/** Starts the notice a watcher sends, so it reaches a completed Envoy. */
+const READY_MARKER = "[PR ready]";
+/**
+ * The watcher automation's script. BB runs it with a bare PATH, so it takes
+ * the user's shell PATH for gh, and BB's own variables for bb and its id.
+ */
+export const WATCHER_SCRIPT = `PATH="$("\${SHELL:-/bin/sh}" -ilc 'printf "\\n%s" "$PATH"' 2>/dev/null | tail -n 1):$PATH"
+bb="\${BB_CLI:-bb}"
+remove() { "$bb" automation delete "$BB_AUTOMATION_ID" --project "$BB_PROJECT_ID" --yes >/dev/null; }
+state=$(gh pr view "$PR_URL" --json state,isDraft --jq 'if .state != "OPEN" then "closed" elif .isDraft then "draft" else "ready" end') || exit 1
+case "$state" in
+  draft) exit 0 ;;
+  closed) remove ;;
+  ready) "$bb" thread tell "$ENVOY_THREAD" "$NOTICE" && remove ;;
+esac
+`;
 export const ENVOY_USAGE = [
   "Usage:",
   "  bb sages envoy list [--json]",
@@ -73,8 +89,6 @@ export type EnvoyConfig = {
   installCommand: string;
   /** The specialist started when an attached PR is ready; "" for none. */
   handoffSpecialist: string;
-  /** Extra instructions sent to that specialist with the PR. */
-  handoffInstructions: string;
   /** Hostnames allowed for issue links; empty allows any. */
   issueHosts: string[];
   /** The permission mode an Envoy starts in unless explicitly chosen. */
@@ -84,7 +98,6 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   preparedProjects: [],
   installCommand: "",
   handoffSpecialist: "",
-  handoffInstructions: "",
   issueHosts: [],
   permissionMode: "full",
 };
@@ -93,8 +106,8 @@ function policy(handoff: string) {
   return `You are an Envoy: complete the user's bounded task in this workspace. Delegate work to available specialists when their role fits; specialist_handoff creates a child in this workspace, so brief it with the goal, ownership, constraints and verification. Keep the user informed and report results and verification in this thread. Do not claim task completion from an idle agent or CI alone.
 All pull requests you open must be DRAFT (gh pr create --draft). Immediately after opening a PR, call envoy_attach_pr with its exact GitHub URL; also attach an existing PR only when it belongs to this task. Never mark a PR ready unless the user explicitly asks. ${
     handoff
-      ? `Sages watches only attached PRs: once one is marked ready (by you on request, or by the user on GitHub), it starts the ${handoff} specialist for follow-up; do not start ${handoff} for that PR yourself.`
-      : "No ready-for-review follow-up is configured, so Sages does not poll PRs."
+      ? `Attaching a PR also sets up a watcher automation you own, which checks it every few minutes. Once the PR is marked ready (by you on request, or by the user on GitHub), the watcher sends you a message starting "[PR ready]" and removes itself. Then hand the PR off with specialist_handoff to the ${handoff} specialist for review and CI follow-up: give it the PR URL and head commit, what the change does and why, the checks you ran and their results, and anything reviewers should know. It has its own instructions for the follow-up, so don't repeat or prescribe them. Hand off once per PR, only after that message.`
+      : "No ready-PR handoff specialist is configured, so attached PRs are not watched; report when a PR is ready."
   } Envoy delegation is authorized within this task.`;
 }
 
@@ -116,11 +129,6 @@ export async function registerEnvoys(
     data: string;
   }[]) {
     const envoy = envoySchema.parse(JSON.parse(row.data));
-    envoy.prs = envoy.prs.map((pr) =>
-      envoy.lifecycle === "cancelled" || pr.handoff === "error"
-        ? { ...pr, watching: false }
-        : pr,
-    );
     db.prepare("UPDATE envoys SET data=? WHERE id=?").run(
       JSON.stringify(envoy),
       envoy.id,
@@ -128,13 +136,8 @@ export async function registerEnvoys(
     records.set(envoy.id, envoy);
   }
   const host = bb.hosts.experimental_client({ contract: envoyHostContract });
-  let disposed = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let watching = false;
   const controller = new AbortController();
   const queues = new Map<string, Promise<unknown>>();
-  const readRetries = new Map<string, { failures: number; after: number }>();
-  const relaunchKeys = new Set<string>();
   function serial<T>(id: string, work: () => Promise<T>): Promise<T> {
     const next = (queues.get(id) ?? Promise.resolve()).then(work, work);
     queues.set(id, next);
@@ -170,22 +173,9 @@ export async function registerEnvoys(
         outputSchema: z.unknown(),
       })
       .catch(() => {});
-    schedule();
     return envoy;
   }
-  function updatePr(id: string, url: string, patch: Partial<EnvoyPr>) {
-    const current = get(id).prs.find((pr) => pr.url === url);
-    if (
-      current &&
-      Object.entries(patch).every(
-        ([key, value]) => current[key as keyof EnvoyPr] === value,
-      )
-    )
-      return get(id);
-    return update(id, {
-      prs: get(id).prs.map((pr) => (pr.url === url ? { ...pr, ...patch } : pr)),
-    });
-  }
+
   async function specialists(): Promise<Specialist[] | null> {
     try {
       const result = await bb.sdk.plugins.callRpc({
@@ -500,30 +490,20 @@ export async function registerEnvoys(
       all.push(...page);
       if (page.length < 100) break;
     }
-    const exempt = new Set(
-      preserveHandoffs
-        ? envoy.prs.map((pr) => pr.handoffThreadId).filter(Boolean)
-        : [],
-    );
-    if (preserveHandoffs) {
-      for (const pr of envoy.prs.filter(
-        (p) => p.handoff === "dispatching" && !p.handoffThreadId,
-      )) {
-        const worker = await findSpawn(
-          envoy.projectId,
-          "specialists",
-          "handoffKey",
-          pr.handoffKey,
-        );
-        if (worker) {
-          exempt.add(worker.id);
-          updatePr(envoy.id, pr.url, {
-            handoff: "started",
-            handoffThreadId: worker.id,
-            watching: false,
-            error: null,
-          });
-        }
+    // The ready-PR handoff worker, started by the Envoy, keeps following
+    // up while the Envoy is parked or completed.
+    const exempt = new Set<string>();
+    const { handoffSpecialist } = await read();
+    const workers = all.filter((t) => t.originPluginId === "specialists");
+    if (preserveHandoffs && handoffSpecialist && workers.length > 0) {
+      for (let at = 0; at < workers.length; at += 100) {
+        const batch = await bb.sdk.threads.experimental_listPluginMetadata({
+          pluginId: "specialists",
+          threadIds: workers.slice(at, at + 100).map((t) => t.id),
+        });
+        for (const each of batch.threads)
+          if (each.metadata.specialist === handoffSpecialist)
+            exempt.add(each.threadId);
       }
     }
     const selected = new Set([envoy.threadId]);
@@ -568,11 +548,11 @@ export async function registerEnvoys(
           if (existing) envoy = adopt(id, existing);
         }
         // Commit cancellation first so delayed handoff completions cannot restart implementation.
-        envoy = update(id, {
-          lifecycle: "cancelled",
-          prs: envoy.prs.map((pr) => ({ ...pr, watching: false })),
-        });
+        envoy = update(id, { lifecycle: "cancelled" });
         await stopImplementation(envoy, false);
+        await unwatch(envoy).catch((error) =>
+          bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
+        );
         return envoy;
       }
       if (envoy.creation !== "ready" || !envoy.threadId)
@@ -600,9 +580,16 @@ export async function registerEnvoys(
           update(id, { lifecycle: envoy.lifecycle });
           throw error;
         }
+        if (envoy.lifecycle === "parked") await rewatch(get(id));
       } else {
         update(id, { lifecycle: state });
         await stopImplementation(envoy);
+        // A parked Envoy leaves nothing running; a completed one keeps
+        // watching so it can still hand off its PR.
+        if (state === "parked")
+          await unwatch(envoy).catch((error) =>
+            bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
+          );
       }
       const result =
         state === "completed"
@@ -611,347 +598,107 @@ export async function registerEnvoys(
       return update(id, { lifecycle: state, result });
     });
   }
-  async function prAction(
-    id: string,
-    raw: string,
-    action: "attach" | "detach" | "retry" | "relaunch" | "stop",
-  ) {
+  // --- PR watchers ---
+  // An Envoy's PR is watched by a BB script automation the Envoy owns
+  // (created from its thread, named for the PR). It tells the Envoy once the
+  // PR is marked ready, so the Envoy hands it off, then deletes itself. The
+  // plugin only creates watchers at attach and removes them when the Envoy
+  // stops: parked, cancelled or archived, or the PR detached.
+
+  /** Lists the watchers an Envoy owns, optionally for one PR. */
+  async function watchers(envoy: Envoy, url?: string) {
+    if (!envoy.threadId) return [];
+    const list = await bb.sdk.plugins.callRpc({
+      pluginId: "automations",
+      method: "automations_list",
+      input: { projectId: envoy.projectId },
+      outputSchema: z.array(
+        z.looseObject({
+          id: z.string(),
+          name: z.string(),
+          createdByThreadId: z.string().nullable().optional(),
+        }),
+      ),
+    });
+    return list.filter(
+      (each) =>
+        each.createdByThreadId === envoy.threadId &&
+        each.name.startsWith(WATCHER_PREFIX) &&
+        (url === undefined || each.name === `${WATCHER_PREFIX}${url}`),
+    );
+  }
+  /** Removes an Envoy's watchers, all of them or one PR's. */
+  async function unwatch(envoy: Envoy, url?: string) {
+    for (const each of await watchers(envoy, url))
+      await bb.sdk.plugins.callRpc({
+        pluginId: "automations",
+        method: "automations_delete",
+        input: { projectId: envoy.projectId, automationId: each.id },
+        outputSchema: z.unknown(),
+      });
+  }
+  /**
+   * Makes sure a PR has a watcher, when a ready-PR handoff specialist is
+   * configured. Returns whether it is watched.
+   */
+  async function watch(envoy: Envoy, url: string) {
+    const { handoffSpecialist } = await read();
+    if (!handoffSpecialist || !envoy.threadId) return false;
+    if ((await watchers(envoy, url)).length > 0) return true;
+    await bb.sdk.plugins.callRpc({
+      pluginId: "automations",
+      method: "automations_create",
+      input: {
+        projectId: envoy.projectId,
+        name: `${WATCHER_PREFIX}${url}`,
+        enabled: true,
+        trigger: { triggerType: "schedule", cron: "*/2 * * * *", timezone: "UTC" },
+        execution: {
+          mode: "script",
+          script: WATCHER_SCRIPT,
+          interpreter: "bash",
+          timeoutMs: 60_000,
+          env: {
+            PR_URL: url,
+            ENVOY_THREAD: envoy.threadId,
+            NOTICE: `${READY_MARKER} ${url} is marked ready for review. Hand it off to the ${handoffSpecialist} specialist now with specialist_handoff, as your instructions describe.`,
+          },
+          workingDirectory: { type: "automation-storage" },
+        },
+        origin: "agent",
+        createdByThreadId: envoy.threadId,
+      },
+      outputSchema: z.unknown(),
+    });
+    return true;
+  }
+  /** Starts watching every attached PR again, for a resumed Envoy. */
+  async function rewatch(envoy: Envoy) {
+    for (const pr of envoy.prs)
+      await watch(envoy, pr.url).catch((error) =>
+        bb.log.warn(`could not watch ${pr.url}: ${errorText(error)}`),
+      );
+  }
+
+  async function prAction(id: string, raw: string, action: "attach" | "detach") {
     return serial(id, async () => {
       const identity = githubPr(raw);
       const envoy = get(id);
-      const current = envoy.prs.find((pr) => pr.url === identity.url);
-      if (
-        envoy.lifecycle === "cancelled" &&
-        ["attach", "retry", "relaunch"].includes(action)
-      )
-        throw new Error(
-          "Resume this Envoy before attaching or retrying PR follow-up",
-        );
-      if (action === "detach")
+      const attached = envoy.prs.some((pr) => pr.url === identity.url);
+      if (action === "detach") {
+        await unwatch(envoy, identity.url);
         return update(id, {
           prs: envoy.prs.filter((pr) => pr.url !== identity.url),
         });
-      if (!current && action !== "attach")
-        throw new Error("That PR is not attached to this Envoy");
-      if (action === "stop")
-        return updatePr(id, identity.url, { watching: false });
-      if (current) {
-        readRetries.delete(current.handoffKey);
-        if (action === "relaunch") {
-          if (current.handoff !== "dispatching" || current.handoffThreadId)
-            throw new Error("Only an unconfirmed handoff can be relaunched");
-          relaunchKeys.add(current.handoffKey);
-        }
-        if (
-          action === "attach" &&
-          (current.error || current.handoff === "error")
-        )
-          return envoy;
-        // Retry preserves the recovery key and searches for an already-created
-        // worker before starting another. Reattaching doesn't duplicate it.
-        return updatePr(id, identity.url, {
-          watching: current.handoff !== "started",
-          ...(["retry", "relaunch"].includes(action)
-            ? {
-                error: null,
-                handoff:
-                  current.handoff === "started"
-                    ? "started"
-                    : current.handoff === "dispatching"
-                      ? "dispatching"
-                      : "pending",
-              }
-            : {}),
-        });
       }
-      return update(id, {
-        prs: [
-          ...envoy.prs,
-          {
-            ...identity,
-            state: "unknown",
-            watching: (await read()).handoffSpecialist !== "",
-            handoffKey: `envoy-pr:${id}:${identity.owner}/${identity.repo}:${identity.number}`,
-            handoff: "pending",
-            handoffThreadId: null,
-            error: null,
-          },
-        ],
-      });
+      if (envoy.lifecycle === "cancelled")
+        throw new Error("Resume this Envoy before attaching a PR");
+      const next = attached
+        ? envoy
+        : update(id, { prs: [...envoy.prs, identity] });
+      if (next.lifecycle !== "parked") await watch(next, identity.url);
+      return next;
     });
-  }
-  async function alert(envoy: Envoy, pr: EnvoyPr, message: string) {
-    if (pr.error === message) return;
-    updatePr(envoy.id, pr.url, { error: message });
-    if (envoy.threadId && envoy.lifecycle === "active")
-      await bb.sdk.threads
-        .send({
-          threadId: envoy.threadId,
-          mode: "auto",
-          input: [
-            {
-              type: "text",
-              text: `Needs attention: PR handoff for ${pr.url}: ${message}`,
-              mentions: [],
-            },
-          ],
-        })
-        .catch((error) => {
-          if (!disposed) bb.log.warn(errorText(error));
-        });
-  }
-  function eligible() {
-    return [...records.values()].some(
-      (e) =>
-        e.lifecycle !== "cancelled" &&
-        e.threadId &&
-        e.prs.some(
-          (pr) =>
-            pr.watching &&
-            pr.handoff !== "error" &&
-            !["closed", "merged"].includes(pr.state),
-        ),
-    );
-  }
-  function schedule() {
-    if (disposed || watching) return;
-    if (!eligible()) {
-      if (timer) clearTimeout(timer);
-      timer = null;
-      return;
-    }
-    if (!timer)
-      timer = setTimeout(() => {
-        timer = null;
-        void checkPrs().catch((error) => bb.log.warn(errorText(error)));
-      }, 60_000);
-  }
-  async function checkPrs() {
-    if (watching || disposed || !eligible()) return;
-    watching = true;
-    try {
-      const settings = await read();
-      for (const envoy of [...records.values()]) {
-        if (!envoy.threadId || envoy.lifecycle === "cancelled") continue;
-        for (const candidate of envoy.prs.filter(
-          (pr) =>
-            pr.watching &&
-            pr.handoff !== "error" &&
-            !["closed", "merged"].includes(pr.state),
-        )) {
-          await serial(envoy.id, async () => {
-            const current = get(envoy.id);
-            const pr = current.prs.find((p) => p.url === candidate.url);
-            if (
-              !pr?.watching ||
-              current.lifecycle === "cancelled" ||
-              disposed ||
-              (readRetries.get(pr.handoffKey)?.after ?? 0) > Date.now()
-            )
-              return;
-            // Without a ready-PR handoff there is nothing to watch for.
-            if (!settings.handoffSpecialist) {
-              updatePr(current.id, pr.url, { watching: false });
-              return;
-            }
-            let readCompleted = false;
-            try {
-              const thread = await bb.sdk.threads.get({
-                threadId: current.threadId!,
-              });
-              if (!thread.environmentId)
-                throw new Error("The Envoy workspace is not ready");
-              const env = await bb.sdk.environments.get({
-                environmentId: thread.environmentId,
-              });
-              const state = await host.call(
-                "prState",
-                { owner: pr.owner, repo: pr.repo, number: pr.number },
-                { hostId: env.hostId, signal: controller.signal },
-              );
-              if (disposed) return;
-              readCompleted = true;
-              readRetries.delete(pr.handoffKey);
-              updatePr(current.id, pr.url, {
-                state: state.state,
-                ...(pr.handoff === "pending" ? { error: null } : {}),
-                ...(state.state === "closed" || state.state === "merged"
-                  ? { watching: false }
-                  : {}),
-              });
-              if (
-                state.state !== "ready" ||
-                pr.handoff === "started" ||
-                pr.handoff === "error"
-              )
-                return;
-              // Detach/reattach and repeated registrations keep the same key.
-              const previous = await findSpawn(
-                current.projectId,
-                "specialists",
-                "handoffKey",
-                pr.handoffKey,
-              );
-              if (previous) {
-                relaunchKeys.delete(pr.handoffKey);
-                updatePr(current.id, pr.url, {
-                  handoff: "started",
-                  handoffThreadId: previous.id,
-                  watching: false,
-                  error: null,
-                });
-                return;
-              }
-              const handoff = settings.handoffSpecialist;
-              if (!(await specialists())?.some((s) => s.name === handoff))
-                throw new Error(
-                  `The ${handoff} specialist is unavailable; restore it or change the ready-PR handoff setting, then retry the handoff`,
-                );
-              updatePr(current.id, pr.url, {
-                handoff: "dispatching",
-                error: null,
-              });
-              if (pr.handoffThreadId) {
-                updatePr(current.id, pr.url, { watching: false });
-                await alert(
-                  current,
-                  pr,
-                  "A handoff worker already exists but its recovery metadata is unavailable; restore its key before retrying.",
-                );
-                return;
-              }
-              // A distinct versioned RPC fails closed against older Specialists installs.
-              try {
-                await bb.sdk.plugins.callRpc({
-                  pluginId: "specialists",
-                  method: "specialists_handoff_capabilities",
-                  input: null,
-                  outputSchema: z.object({ keyedHandoffVersion: z.literal(1) }),
-                });
-              } catch (error) {
-                throw new Error(
-                  `Update or enable Specialists with keyed handoff version 1, then Retry: ${errorText(error)}`,
-                );
-              }
-              const response = await bb.sdk.plugins.callRpc({
-                pluginId: "specialists",
-                method: "specialists_handoff_keyed",
-                input: {
-                  specialist: handoff,
-                  task: [
-                    `This Envoy PR is ready for review: ${pr.url}\nObserved head: ${state.head}\nOrigin thread: ${current.threadId}\nFollow your procedure for a PR that is ready for review and report the outcome. Do not create another readiness watcher.`,
-                    settings.handoffInstructions.trim(),
-                  ]
-                    .filter(Boolean)
-                    .join("\n\n"),
-                  projectId: current.projectId,
-                  environmentId: thread.environmentId,
-                  requestedBy: `Envoy ${current.name}`,
-                  parentThreadId: current.threadId,
-                  handoffKey: pr.handoffKey,
-                  relaunchUncertain: relaunchKeys.delete(pr.handoffKey),
-                },
-                outputSchema: z.object({
-                  status: z.enum(["started", "failed", "uncertain"]),
-                  threadId: z.string().nullable(),
-                  error: z.string().nullable(),
-                }),
-              });
-              if (disposed) return;
-              if (response.status !== "started" || !response.threadId) {
-                updatePr(current.id, pr.url, {
-                  handoff:
-                    response.status === "failed" ? "error" : "dispatching",
-                  watching: false,
-                });
-                await alert(
-                  current,
-                  pr,
-                  response.error ??
-                    "The handoff launch outcome is unconfirmed; retry recovery.",
-                );
-                return;
-              }
-              const batch =
-                await bb.sdk.threads.experimental_listPluginMetadata({
-                  pluginId: "specialists",
-                  threadIds: [response.threadId],
-                });
-              if (
-                !batch.threads.some(
-                  (t) =>
-                    t.threadId === response.threadId &&
-                    t.metadata.handoffKey === pr.handoffKey,
-                )
-              ) {
-                updatePr(current.id, pr.url, {
-                  handoffThreadId: response.threadId,
-                  watching: false,
-                });
-                await alert(
-                  current,
-                  pr,
-                  "The Specialists worker has no recovery key. Update Specialists before retrying; the existing worker must not be duplicated.",
-                );
-                return;
-              }
-              updatePr(current.id, pr.url, {
-                handoff: "started",
-                handoffThreadId: response.threadId,
-                watching: false,
-                error: null,
-              });
-            } catch (error) {
-              if (disposed) return;
-              const latest = get(envoy.id).prs.find((p) => p.url === pr.url)!;
-              // Lost replies may have committed a worker. Recover once, then pause
-              // instead of making endless GitHub requests while waiting for Retry.
-              if (latest.handoff === "dispatching") {
-                try {
-                  const worker = await findSpawn(
-                    current.projectId,
-                    "specialists",
-                    "handoffKey",
-                    pr.handoffKey,
-                  );
-                  if (worker) {
-                    updatePr(current.id, pr.url, {
-                      handoff: "started",
-                      handoffThreadId: worker.id,
-                      watching: false,
-                      error: null,
-                    });
-                    return;
-                  }
-                } catch {
-                  /* Leave the durable keyed launch for explicit recovery. */
-                }
-              }
-              updatePr(envoy.id, pr.url, {
-                watching: !readCompleted && latest.handoff === "pending",
-                ...(readCompleted && latest.handoff !== "dispatching"
-                  ? { handoff: "error" as const }
-                  : {}),
-              });
-              if (!readCompleted && latest.handoff === "pending") {
-                const failures =
-                  (readRetries.get(pr.handoffKey)?.failures ?? 0) + 1;
-                readRetries.set(pr.handoffKey, {
-                  failures,
-                  after:
-                    Date.now() +
-                    Math.min(60_000 * 2 ** Math.min(failures - 1, 4), 900_000),
-                });
-              }
-              await alert(get(envoy.id), latest, errorText(error));
-            }
-          });
-        }
-      }
-    } finally {
-      watching = false;
-      schedule();
-    }
   }
   bb.rpc.register(envoyRpcContract, {
     envoys_list: () => ({
@@ -1003,7 +750,7 @@ export async function registerEnvoys(
   bb.agents.registerTool({
     name: PR_TOOL,
     description:
-      "Attach this Envoy's GitHub PR so Sages tracks it, and watches for it to be marked ready when a ready-PR handoff is configured. Required immediately after opening a draft PR. It does not mark the PR ready.",
+      "Attach this Envoy's GitHub PR so Sages tracks it and, when a ready-PR handoff specialist is configured, tells you once it is marked ready so you can hand it off. Required immediately after opening a draft PR. It does not mark the PR ready.",
     parameters: z.object({ url: z.string().max(2000) }),
     execute: async ({ url }, { threadId }) => {
       const envoy = [...records.values()].find((e) => e.threadId === threadId);
@@ -1014,7 +761,8 @@ export async function registerEnvoys(
       const updated = await prAction(envoy.id, url, "attach");
       const pr = updated.prs.find((p) => p.url === githubPr(url).url)!;
       const { handoffSpecialist } = await read();
-      return `Attached ${pr.url}. ${pr.watching ? `Ready-for-review monitoring is active; ${handoffSpecialist} starts when you or the user marks it ready.` : pr.handoff === "started" ? "PR handoff has already started." : handoffSpecialist ? "PR follow-up is paused; use Retry in Envoy details." : "No ready-PR handoff is configured, so it is not watched."}`;
+      const watched = (await watchers(updated, pr.url)).length > 0;
+      return `Attached ${pr.url}. ${watched ? `A watcher automation you own checks it every 2 minutes: once you or the user marks it ready, you get a message starting "${READY_MARKER}" telling you to hand it off to ${handoffSpecialist}.` : handoffSpecialist ? "It is not watched while this Envoy is parked." : "No ready-PR handoff specialist is configured, so it is not watched."}`;
     },
   });
   // Startup recovery and checking are dormant until actual records need work.
@@ -1044,7 +792,6 @@ export async function registerEnvoys(
           );
         }
       }
-      await checkPrs();
     },
   });
   bb.experimental_hooks.on("message.dispatch", (context) => {
@@ -1057,8 +804,16 @@ export async function registerEnvoys(
       envoy.lifecycle === "creating"
     )
       return { action: "proceed" };
+    // A completed Envoy still hands off its own PR when its watcher says so.
+    if (
+      envoy.lifecycle === "completed" &&
+      context.input.text.trimStart().startsWith(READY_MARKER)
+    )
+      return { action: "proceed" };
     if (envoy.lifecycle !== "cancelled" && context.initiator === "user") {
-      update(envoy.id, { lifecycle: "active" });
+      const wasParked = envoy.lifecycle === "parked";
+      const resumed = update(envoy.id, { lifecycle: "active" });
+      if (wasParked) void rewatch(resumed);
       return { action: "proceed" };
     }
     return {
@@ -1106,15 +861,21 @@ export async function registerEnvoys(
       if (envoy.reportTo) report(envoy, "failed", error ?? "no error given");
     }
   });
+  // An archived (or deleted) Envoy thread leaves no watcher behind.
+  bb.events.on("thread.archived", ({ thread }) => {
+    const envoy = [...records.values()].find((e) => e.threadId === thread.id);
+    if (envoy)
+      void unwatch(envoy).catch((error) =>
+        bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
+      );
+  });
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const envoy = [...records.values()].find((e) => e.threadId === thread.id);
     if (envoy?.reportTo)
       report(envoy, "finished", lastAssistantText ?? "(no final message)");
   });
   bb.onDispose(() => {
-    disposed = true;
     controller.abort();
-    if (timer) clearTimeout(timer);
   });
 
   return {

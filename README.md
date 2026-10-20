@@ -60,34 +60,29 @@ Envoy delegation or Send Envoy control: creating one from those chats requires t
 explicit instruction.
 
 PRs must be opened as drafts and attached with `envoy_attach_pr` or the details dialog.
-Only Envoys with attached PRs allocate a polling timer or make GitHub requests. Readiness
-is checked once per minute on the workspace's machine through authenticated `gh`; the
-plugin never discovers PRs by branch and never marks them ready. Once the user marks a
-PR ready (or explicitly asks the Envoy to), the plugin starts the specialist chosen as
-**Ready-PR handoff specialist**, with the PR, its head and `envoyReadyHandoffInstructions`
-(your CI or review procedure, if any). Leave the specialist empty for no automatic
-handoff: attached PRs are then listed but never polled. Its worker
-is parented to the Envoy and recovered by a persisted key across reloads or interrupted
-responses. Readiness polling stops after handoff, detachment, closure or merge. Missing
-specialists and GitHub failures appear in task details with a retry action.
-Read-only readiness failures retry automatically with a capped backoff; handoff
-errors pause until Retry. Sages requires Specialists' keyed handoff
-protocol v1 and verifies worker metadata, so an older plugin cannot silently
-launch an unkeyed monitor.
+The Envoy owns the PR end to end, including its handoff. When a **Ready-PR handoff
+specialist** is chosen in the settings, attaching a PR also creates a watcher: a BB
+script automation owned by the Envoy (created from its thread, named
+`Envoy PR watcher: <url>`, visible in Automations). Every 2 minutes it checks the PR with
+`gh` on the BB server's machine. Once the PR is marked ready, by the user on GitHub or by
+the Envoy on request, the watcher messages the Envoy with `[PR ready] …` and deletes
+itself; a closed or merged PR just deletes it. The Envoy then hands the PR off with
+`specialist_handoff`, briefing the specialist with the PR, its head, what changed and the
+checks it ran. The specialist keeps its own instructions for the follow-up; nothing about
+that procedure lives in Sages. The plugin never polls GitHub itself. With no specialist
+chosen, attached PRs are only listed.
 
-An unconfirmed handoff only searches for its original worker. **Relaunch handoff**
-requires explicit confirmation, searches again, and permits a new attempt only
-when no worker is found. An earlier delayed request may still create a duplicate,
-so use this only after ordinary recovery fails.
+Watchers never outlive their Envoy: parking, cancelling, or archiving the Envoy's thread
+deletes them, and detaching a PR deletes its watcher. Resuming a parked Envoy creates them
+again. A completed Envoy keeps its watchers, and the `[PR ready]` message is the one
+automated message that reaches it, so it can still hand off.
 
-Park stops implementation threads while preserving the visible chat, workspace, attached
-PR watcher and registered handoff workers. Resume continues the directive; complete stores
-the task's final output. Complete keeps attached PR follow-up. Cancel stops readiness watchers and
-handoff agents as well as implementation; resume the task before restarting PR
-follow-up. Automated notices cannot resume parked, completed or cancelled tasks.
-A user message resumes parked or completed tasks. Cancelled tasks require Resume.
-After resuming a cancelled task, open its handoff thread to resume a stopped worker.
-Anything a handoff worker scheduled elsewhere, such as automations, is managed there. These actions do not delete the workspace; cleanup remains a separate native BB action.
+Park stops implementation threads while preserving the visible chat, workspace and the
+Envoy's handoff worker (its child thread running the chosen specialist). Resume continues
+the directive; complete stores the task's final output. Cancel stops all of the Envoy's
+child threads. Other automated notices cannot resume parked, completed or cancelled
+tasks. A user message resumes parked or completed tasks. Cancelled tasks require Resume.
+These actions do not delete the workspace; cleanup remains a separate native BB action.
 
 A sage starts one with its `sage_envoy(task, project?, name?, issueUrl?,
 specialist?, requestId?)` tool, which takes a project id or name and creates
@@ -212,8 +207,8 @@ bb already has set up:
 
 - **Summary model**: bb's provider/model/reasoning picker for compactions and
   acolyte summaries. Unset, they run on bb's default.
-- **Ready-PR handoff specialist**: a list of your Specialists. Started when an
-  Envoy's attached PR is marked ready; with none, attached PRs are never polled.
+- **Ready-PR handoff specialist**: a list of your Specialists. An Envoy hands its
+  PR to it once the PR is marked ready; with none, attached PRs get no watcher.
 
 The remaining fields:
 
@@ -221,7 +216,6 @@ The remaining fields:
 | --- | --- | --- |
 | `envoyPreparedProjects` | empty | Project IDs whose base checkout is fast-forwarded before each new Envoy. |
 | `envoyInstallCommand` | empty | Shell command run in a prepared checkout, and asked of each new worktree. |
-| `envoyReadyHandoffInstructions` | empty | Extra instructions sent to that specialist with each PR. |
 | `envoyPermissionMode` | `full` | Permission level a new Envoy starts in (Full Access, Auto or Accept Edits), unless explicitly chosen in the New Envoy composer. |
 | `envoyIssueHosts` | empty | Hostnames allowed for issue links; empty accepts any https link. |
 

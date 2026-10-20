@@ -6,7 +6,7 @@ import {
   makePluginAgentConfigurationContext,
   makeMessageDispatchHookContext,
 } from "@get-bb/plugin-sdk/testing";
-import { registerEnvoys } from "./envoys.ts";
+import { registerEnvoys, WATCHER_SCRIPT } from "./envoys.ts";
 import { githubPr, issueLink } from "./envoy-contract.ts";
 
 const specialist = {
@@ -35,19 +35,22 @@ const request = {
 async function setup(
   options: {
     missingSpecialist?: boolean;
-    interruptedHandoff?: boolean;
     spawnError?: unknown;
-    handoffError?: unknown;
-    oldSpecialists?: boolean;
     hostError?: boolean;
-    uncertainHandoff?: boolean;
     lead?: boolean;
     prepare?: boolean;
     noHandoff?: boolean;
     issueHosts?: string[];
   } = {},
 ) {
-  let state = "draft";
+  /** The Automations plugin's records, as its RPCs see them. */
+  const automations: {
+    id: string;
+    projectId: string;
+    name: string;
+    createdByThreadId: string | null;
+    input: any;
+  }[] = [];
   const reports: { name: string; outcome: string; text: string }[] = [];
   let spawnCount = 0;
   let handoffCount = 0;
@@ -59,7 +62,7 @@ async function setup(
     experimental_callHostRpc: async ({ method }) => {
       if (options.hostError) throw new Error("Host temporarily offline");
       if (method === "prepareSource") return { commit: "a".repeat(40), branch: "main" };
-      return { state, head: "head-1" };
+      throw new Error(`unexpected host call ${method}`);
     },
     sdk: {
       projects: {
@@ -123,7 +126,6 @@ async function setup(
       },
       plugins: {
         callRpc: async (args) => {
-          const input = args.input as Record<string, unknown>;
           if (args.method === "specialists_list")
             return {
               specialists: options.missingSpecialist
@@ -139,38 +141,30 @@ async function setup(
                       : specialist,
                   ],
             };
-          if (args.method === "specialists_handoff_capabilities") {
-            if (options.oldSpecialists)
-              throw new Error("unknown_method: update Specialists");
-            return { keyedHandoffVersion: 1 };
+          if (args.pluginId === "automations") {
+            const input = args.input as any;
+            if (args.method === "automations_list")
+              return automations.filter((a) => a.projectId === input.projectId);
+            if (args.method === "automations_create") {
+              const record = {
+                id: `auto-${automations.length + 1}`,
+                projectId: input.projectId,
+                name: input.name,
+                createdByThreadId: input.createdByThreadId ?? null,
+                input,
+              };
+              automations.push(record);
+              return record;
+            }
+            if (args.method === "automations_delete") {
+              const at = automations.findIndex((a) => a.id === input.automationId);
+              if (at >= 0) automations.splice(at, 1);
+              return { ok: true };
+            }
           }
-          if (args.method === "specialists_handoff_keyed") {
-            if (options.uncertainHandoff && !input.relaunchUncertain)
-              return {
-                status: "uncertain",
-                threadId: null,
-                error: "Unknown launch outcome",
-              };
-            if (options.handoffError)
-              return {
-                status: "failed",
-                threadId: null,
-                error: String(options.handoffError),
-              };
+          // Envoys hand off themselves; the plugin must never start one.
+          if (String(args.method).startsWith("specialists_handoff"))
             handoffCount++;
-            const thread = makeThreadResponse({
-              id: `worker-${handoffCount}`,
-              projectId: "project-1",
-              environmentId: "environment-1",
-              parentThreadId: String(input.parentThreadId),
-              originPluginId: "specialists",
-            });
-            threads.set(thread.id, thread);
-            metadata.set(thread.id, { handoffKey: input.handoffKey });
-            if (options.interruptedHandoff)
-              throw new Error("Response interrupted after commit");
-            return { status: "started", threadId: thread.id, error: null };
-          }
           return { ok: true };
         },
       },
@@ -180,7 +174,6 @@ async function setup(
     preparedProjects: options.prepare ? ["project-1"] : [],
     installCommand: "npm ci",
     handoffSpecialist: options.noHandoff ? "" : "ready-pr",
-    handoffInstructions: "Check CI, then remind reviewers.",
     issueHosts: options.issueHosts ?? [],
     permissionMode: "full",
   }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }));
@@ -199,10 +192,8 @@ async function setup(
     threads,
     metadata,
     options,
-    setState: (next: string) => {
-      state = next;
-    },
     counts: () => ({ spawnCount, handoffCount }),
+    automations,
     reports,
   };
 }
@@ -232,24 +223,22 @@ test("URLs are explicit provider identities, not branch inference or arbitrary e
   assert.equal(githubPr("https://github.com/owner/repo/pull/123").number, 123);
 });
 
-test("without a ready-PR handoff, attached PRs are recorded but never polled", async () => {
+test("without a ready-PR handoff, attached PRs are recorded but never watched", async () => {
   const s = await setup({ noHandoff: true, issueHosts: ["tracker.example.com"] });
   try {
     const envoy = await s.create();
     assert.equal(envoy.issue.key, "ABC-123");
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as any;
-    assert.match(spawn.input[0].text, /Sages does not poll PRs/);
-    assert.doesNotMatch(spawn.input[0].text, /starts the ready-pr specialist/);
+    assert.match(spawn.input[0].text, /attached PRs are not watched/);
+    assert.doesNotMatch(spawn.input[0].text, /hand the PR off/);
     const attached = (await s.harness.behavior.callRpc("envoys_pr", {
       id: envoy.id,
       url: "https://github.com/owner/repo/pull/123",
       action: "attach",
     })) as any;
-    assert.equal(attached.prs[0].watching, false);
-    s.setState("ready");
-    await s.sweep();
+    assert.equal(attached.prs.length, 1);
+    assert.equal(s.automations.length, 0);
     assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 0);
-    assert.equal(s.counts().handoffCount, 0);
   } finally {
     await s.harness.lifecycle.dispose();
   }
@@ -270,7 +259,7 @@ test("ordinary lead, generated name, stable visible thread, preserved permission
     assert.equal(spawn.permissionMode, "accept-edits");
     assert.equal(spawn.environment.workspace.type, "managed-worktree");
     assert.match(spawn.input[0].text, /DRAFT.*gh pr create --draft/);
-    assert.match(spawn.input[0].text, /ready-pr specialist/);
+    assert.match(spawn.input[0].text, /hand the PR off with specialist_handoff to the ready-pr specialist/);
     const plain = s.helpers.configure(makePluginAgentConfigurationContext());
     assert.deepEqual(plain.tools, []);
     const envoy = s.helpers.configure(
@@ -298,66 +287,54 @@ test("ordinary lead, generated name, stable visible thread, preserved permission
   }
 });
 
-test("draft attachment activates reads, readiness triggers exactly one parented handoff, detaching stops reads", async () => {
+test("attaching a PR creates one watcher the Envoy owns, and detaching removes it", async () => {
   const s = await setup();
   try {
     const envoy = await s.create();
     const url = "https://github.com/owner/repo/pull/123";
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "attach",
-    });
-    await s.sweep();
-    assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 1);
+    for (let i = 0; i < 2; i++)
+      await s.harness.behavior.callRpc("envoys_pr", { id: envoy.id, url, action: "attach" });
+    assert.equal(s.automations.length, 1);
+    const watcher = s.automations[0]!;
+    assert.equal(watcher.name, `Envoy PR watcher: ${url}`);
+    assert.equal(watcher.createdByThreadId, envoy.threadId);
+    assert.equal(watcher.input.origin, "agent");
+    assert.equal(watcher.input.trigger.triggerType, "schedule");
+    assert.equal(watcher.input.execution.mode, "script");
+    assert.equal(watcher.input.execution.env.PR_URL, url);
+    assert.equal(watcher.input.execution.env.ENVOY_THREAD, envoy.threadId);
+    assert.match(watcher.input.execution.env.NOTICE, /^\[PR ready\] .* Hand it off to the ready-pr specialist/);
+    // The plugin never polls or starts the specialist itself.
+    assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 0);
     assert.equal(s.counts().handoffCount, 0);
-    s.setState("ready");
-    await s.sweep();
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 1);
-    const handoff = s.harness.inspection.sdk
-      .callsTo("plugins.callRpc")
-      .find(
-        (call) => (call[0] as any).method === "specialists_handoff_keyed",
-      )![0] as any;
-    assert.equal(handoff.input.parentThreadId, envoy.threadId);
-    assert.equal(handoff.input.environmentId, "environment-1");
-    assert.match(handoff.input.handoffKey, /envoy-pr:/);
-    assert.equal(handoff.input.specialist, "ready-pr");
-    assert.match(handoff.input.task, /Check CI, then remind reviewers\./);
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "detach",
-    });
-    const reads = s.harness.inspection.experimental_hostRpcCalls.length;
-    await s.sweep();
-    assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, reads);
+    await s.harness.behavior.callRpc("envoys_pr", { id: envoy.id, url, action: "detach" });
+    assert.equal(s.automations.length, 0);
   } finally {
     await s.harness.lifecycle.dispose();
   }
 });
 
-test("parking stops implementation descendants and preserves the workspace and PR monitor", async () => {
+test("parking stops implementation descendants but spares the Envoy's own handoff worker", async () => {
   const s = await setup();
   try {
     const envoy = await s.create();
-    s.threads.set(
-      "coder",
-      makeThreadResponse({
-        id: "coder",
-        status: "active",
-        parentThreadId: envoy.threadId,
-        projectId: "project-1",
-      }),
-    );
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url: "https://github.com/owner/repo/pull/123",
-      action: "attach",
-    });
-    s.setState("ready");
-    await s.sweep();
+    for (const [id, originPluginId, specialistName] of [
+      ["coder", "specialists", "coder"],
+      ["handoff", "specialists", "ready-pr"],
+      ["helper", null, null],
+    ] as const) {
+      s.threads.set(
+        id,
+        makeThreadResponse({
+          id,
+          status: "active",
+          parentThreadId: envoy.threadId,
+          projectId: "project-1",
+          ...(originPluginId ? { originPluginId } : {}),
+        }),
+      );
+      if (specialistName) s.metadata.set(id, { specialist: specialistName });
+    }
     await s.harness.behavior.callRpc("envoys_lifecycle", {
       id: envoy.id,
       lifecycle: "parked",
@@ -365,7 +342,7 @@ test("parking stops implementation descendants and preserves the workspace and P
     const stopped = s.harness.inspection.sdk
       .callsTo("threads.stop")
       .map((c) => (c[0] as any).threadId);
-    assert.deepEqual(stopped.sort(), ["coder", envoy.threadId].sort());
+    assert.deepEqual(stopped.sort(), ["coder", "helper", envoy.threadId].sort());
     assert.equal(s.harness.inspection.sdk.callsTo("threads.archive").length, 0);
     assert.equal(
       s.harness.inspection.sdk.callsTo("environments.delete").length,
@@ -415,108 +392,6 @@ test("reload recovers a committed spawn without starting a duplicate", async () 
   }
 });
 
-test("PR monitoring allocates no timer before attachment and stops after closure or merge", async (t) => {
-  const s = await setup();
-  const timer = t.mock.method(globalThis, "setTimeout");
-  try {
-    const envoy = await s.create();
-    await s.sweep();
-    assert.equal(timer.mock.calls.length, 0);
-    for (const [number, state] of [
-      [1, "closed"],
-      [2, "merged"],
-    ] as const) {
-      const url = `https://github.com/owner/repo/pull/${number}`;
-      await s.harness.behavior.callRpc("envoys_pr", {
-        id: envoy.id,
-        url,
-        action: "attach",
-      });
-      s.setState(state);
-      await s.sweep();
-      const reads = s.harness.inspection.experimental_hostRpcCalls.length;
-      await s.sweep();
-      assert.equal(
-        s.harness.inspection.experimental_hostRpcCalls.length,
-        reads,
-      );
-      const stored = (await s.harness.behavior.callRpc("envoys_get", {
-        threadId: envoy.threadId,
-      })) as any;
-      assert.equal(stored.prs.at(-1).watching, false);
-    }
-    assert.equal(s.counts().handoffCount, 0);
-  } finally {
-    await s.harness.lifecycle.dispose();
-  }
-});
-
-test("an already-ready PR recovers an interrupted handoff and detach/reattach retains one worker", async () => {
-  const s = await setup({ interruptedHandoff: true });
-  try {
-    const envoy = await s.create();
-    const url = "https://github.com/owner/repo/pull/123";
-    s.setState("ready");
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "attach",
-    });
-    await s.sweep();
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 1);
-    let stored = (await s.harness.behavior.callRpc("envoys_get", {
-      threadId: envoy.threadId,
-    })) as any;
-    assert.equal(stored.prs[0].handoffThreadId, "worker-1");
-    assert.equal(stored.prs[0].error, null);
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "detach",
-    });
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url: "https://github.com/OWNER/Repo/pull/123",
-      action: "attach",
-    });
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 1);
-    stored = (await s.harness.behavior.callRpc("envoys_get", {
-      threadId: envoy.threadId,
-    })) as any;
-    assert.equal(stored.prs[0].handoff, "started");
-  } finally {
-    await s.harness.lifecycle.dispose();
-  }
-});
-
-test("missing mandatory specialist is surfaced and a parked Envoy is not restarted by an alert", async () => {
-  const s = await setup({ missingSpecialist: true });
-  try {
-    const envoy = await s.create();
-    await s.harness.behavior.callRpc("envoys_lifecycle", {
-      id: envoy.id,
-      lifecycle: "parked",
-    });
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url: "https://github.com/owner/repo/pull/123",
-      action: "attach",
-    });
-    s.setState("ready");
-    await s.sweep();
-    const stored = (await s.harness.behavior.callRpc("envoys_get", {
-      threadId: envoy.threadId,
-    })) as any;
-    assert.match(stored.prs[0].error, /ready-pr specialist is unavailable/);
-    assert.equal(s.harness.inspection.sdk.callsTo("threads.send").length, 0);
-    assert.equal(s.counts().handoffCount, 0);
-  } finally {
-    await s.harness.lifecycle.dispose();
-  }
-});
-
 test("definite rejection retries the same task with corrected selections; uncertainty can be cancelled without relaunching", async () => {
   const s = await setup({
     spawnError: Object.assign(new Error("Invalid model"), { status: 400 }),
@@ -559,110 +434,82 @@ test("definite rejection retries the same task with corrected selections; uncert
   }
 });
 
-test("cancel stops PR follow-up and monitors, completed tasks keep follow-up, parked completion notices cannot restart implementation", async () => {
-  for (const lifecycle of ["completed", "cancelled"] as const) {
-    const s = await setup();
-    try {
-      const envoy = await s.create();
-      const url = "https://github.com/owner/repo/pull/123";
-      await s.harness.behavior.callRpc("envoys_pr", {
-        id: envoy.id,
-        url,
-        action: "attach",
-      });
-      await s.harness.behavior.callRpc("envoys_lifecycle", {
-        id: envoy.id,
-        lifecycle,
-      });
-      s.setState("ready");
-      await s.sweep();
-      assert.equal(s.counts().handoffCount, lifecycle === "completed" ? 1 : 0);
-      if (lifecycle === "cancelled")
-        assert.equal(s.harness.inspection.experimental_hostRpcCalls.length, 0);
-    } finally {
-      await s.harness.lifecycle.dispose();
-    }
-  }
+test("parking and cancelling remove watchers, resuming restores them, completing keeps them", async () => {
   const s = await setup();
   try {
     const envoy = await s.create();
-    await s.harness.behavior.callRpc("envoys_lifecycle", {
+    const url = "https://github.com/owner/repo/pull/123";
+    await s.harness.behavior.callRpc("envoys_pr", { id: envoy.id, url, action: "attach" });
+    assert.equal(s.automations.length, 1);
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "parked" });
+    assert.equal(s.automations.length, 0);
+    // Attaching while parked records the PR but leaves nothing running.
+    await s.harness.behavior.callRpc("envoys_pr", {
       id: envoy.id,
-      lifecycle: "parked",
+      url: "https://github.com/owner/repo/pull/124",
+      action: "attach",
     });
-    const hook = s.harness.inspection.registrations.hooks["message.dispatch"]!;
-    const automated = await hook(
-      makeMessageDispatchHookContext({
-        thread: s.threads.get(envoy.threadId)!,
-        initiator: "system",
-      }),
-    );
-    assert.equal(automated.action, "reject");
-    const user = await hook(
-      makeMessageDispatchHookContext({
-        thread: s.threads.get(envoy.threadId)!,
-        initiator: "user",
-      }),
-    );
-    assert.equal(user.action, "proceed");
-    const task = (await s.harness.behavior.callRpc("envoys_get", {
-      threadId: envoy.threadId,
-    })) as any;
-    assert.equal(task.lifecycle, "active");
-    await s.harness.behavior.callRpc("envoys_lifecycle", {
-      id: envoy.id,
-      lifecycle: "active",
-    });
-    assert.equal(
-      s.harness.inspection.sdk.callsTo("threads.unarchive").length,
-      0,
-    );
+    assert.equal(s.automations.length, 0);
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "active" });
+    assert.equal(s.automations.length, 2);
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" });
+    assert.equal(s.automations.length, 2);
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "cancelled" });
+    assert.equal(s.automations.length, 0);
   } finally {
     await s.harness.lifecycle.dispose();
   }
 });
 
-test("host errors back off and failed handoffs pause polling and Retry makes progress; older Specialists fail closed", async () => {
-  for (const options of [
-    { hostError: true },
-    { handoffError: "Rejected before commit" },
-    { oldSpecialists: true },
-  ]) {
-    const s = await setup(options);
-    try {
-      const envoy = await s.create();
-      const url = "https://github.com/owner/repo/pull/123";
-      s.setState("ready");
-      await s.harness.behavior.callRpc("envoys_pr", {
-        id: envoy.id,
-        url,
-        action: "attach",
-      });
-      await s.sweep();
-      const reads = s.harness.inspection.experimental_hostRpcCalls.length;
-      await s.sweep();
-      assert.equal(
-        s.harness.inspection.experimental_hostRpcCalls.length,
-        reads,
+test("an archived Envoy thread loses its watchers, and other automations are left alone", async () => {
+  const s = await setup();
+  try {
+    const envoy = await s.create();
+    s.automations.push({
+      id: "mine",
+      projectId: "project-1",
+      name: "Nightly report",
+      createdByThreadId: envoy.threadId,
+      input: {},
+    });
+    await s.harness.behavior.callRpc("envoys_pr", {
+      id: envoy.id,
+      url: "https://github.com/owner/repo/pull/123",
+      action: "attach",
+    });
+    await s.harness.behavior.emitThreadEvent("thread.archived", {
+      thread: s.threads.get(envoy.threadId)!,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(s.automations.map((a) => a.id), ["mine"]);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("a parked Envoy refuses automated messages, but a completed one takes its watcher's notice", async () => {
+  const s = await setup();
+  try {
+    const envoy = await s.create();
+    const hook = s.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const send = (text: string, initiator: "system" | "user") =>
+      hook(
+        makeMessageDispatchHookContext({
+          thread: s.threads.get(envoy.threadId)!,
+          initiator,
+          input: { text, blocks: [{ type: "text", text, mentions: [] }] },
+        } as any),
       );
-      assert.equal(s.counts().handoffCount, 0);
-      const task = (await s.harness.behavior.callRpc("envoys_get", {
-        threadId: envoy.threadId,
-      })) as any;
-      assert.equal(task.prs[0].watching, !!options.hostError);
-      s.options.hostError = false;
-      s.options.handoffError = undefined;
-      s.options.oldSpecialists = false;
-      await s.harness.behavior.callRpc("envoys_pr", {
-        id: envoy.id,
-        url,
-        action: "retry",
-      });
-      await s.sweep();
-      assert.equal(s.counts().handoffCount, 1);
-    } finally {
-      await s.harness.lifecycle.dispose();
-    }
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" });
+    assert.equal((await send("[PR ready] https://github.com/owner/repo/pull/123 is marked ready", "system")).action, "proceed");
+    assert.equal((await send("Some other notice", "system")).action, "reject");
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "parked" });
+    assert.equal((await send("[PR ready] https://github.com/owner/repo/pull/123 is marked ready", "system")).action, "reject");
+    assert.equal((await send("Please continue", "user")).action, "proceed");
+    const task = (await s.harness.behavior.callRpc("envoys_get", { threadId: envoy.threadId })) as any;
+    assert.equal(task.lifecycle, "active");
+  } finally {
+    await s.harness.lifecycle.dispose();
   }
 });
 
@@ -708,93 +555,6 @@ test("lead defaults apply with provenance, while explicit selections and workspa
       assert.equal(args.executionInputSources.model, "explicit");
     }
   } finally {
-    await s.harness.lifecycle.dispose();
-  }
-});
-
-test("unconfirmed PR handoff needs explicit relaunch and cancel stops an existing worker and late child", async () => {
-  const s = await setup({ uncertainHandoff: true });
-  try {
-    const envoy = await s.create();
-    const url = "https://github.com/owner/repo/pull/123";
-    s.setState("ready");
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "attach",
-    });
-    await s.sweep();
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "retry",
-    });
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 0);
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "relaunch",
-    });
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 1);
-    const worker = s.threads.get("worker-1")!;
-    s.threads.set(worker.id, { ...worker, status: "active" });
-    await s.harness.behavior.callRpc("envoys_lifecycle", {
-      id: envoy.id,
-      lifecycle: "cancelled",
-    });
-    assert.ok(
-      s.harness.inspection.sdk
-        .callsTo("threads.stop")
-        .some((args) => (args[0] as any).threadId === worker.id),
-    );
-    const hook = s.harness.inspection.registrations.hooks["message.dispatch"]!;
-    assert.equal(
-      (
-        await hook(
-          makeMessageDispatchHookContext({
-            thread: s.threads.get(envoy.threadId)!,
-            initiator: "user",
-          }),
-        )
-      ).action,
-      "reject",
-    );
-    await s.harness.behavior.emitThreadEvent("thread.active", {
-      thread: worker,
-    });
-    assert.equal(
-      (s.harness.inspection.sdk.callsTo("threads.stop").at(-1)![0] as any)
-        .threadId,
-      worker.id,
-    );
-  } finally {
-    await s.harness.lifecycle.dispose();
-  }
-});
-
-test("read-only host failures recover automatically after backoff without a Retry click", async () => {
-  const s = await setup({ hostError: true });
-  const realNow = Date.now;
-  let now = realNow();
-  Date.now = () => now;
-  try {
-    const envoy = await s.create();
-    const url = "https://github.com/owner/repo/pull/123";
-    await s.harness.behavior.callRpc("envoys_pr", {
-      id: envoy.id,
-      url,
-      action: "attach",
-    });
-    await s.sweep();
-    s.options.hostError = false;
-    s.setState("ready");
-    now += 60_001;
-    await s.sweep();
-    assert.equal(s.counts().handoffCount, 1);
-  } finally {
-    Date.now = realNow;
     await s.harness.lifecycle.dispose();
   }
 });
@@ -933,5 +693,59 @@ test("the permission setting applies unless the composer chose one explicitly", 
     assert.deepEqual(modes, ["full", "full", "accept-edits"]);
   } finally {
     await s.harness.lifecycle.dispose();
+  }
+});
+
+test("the watcher script tells the Envoy once its PR is ready, then removes itself", async () => {
+  const { mkdtemp, writeFile, chmod, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const dir = await mkdtemp(join(tmpdir(), "envoy-watcher-"));
+  try {
+    const log = join(dir, "bb.log");
+    // A shell whose PATH holds the fake gh, as the user's shell would.
+    await writeFile(join(dir, "shell"), `#!/bin/sh\nprintf '\\n%s' "${dir}:/usr/bin:/bin"\n`);
+    await writeFile(
+      join(dir, "gh"),
+      `#!/bin/sh\ncase "$PR_STATE" in draft) echo draft;; ready) echo ready;; *) echo closed;; esac\n`,
+    );
+    await writeFile(join(dir, "bb"), `#!/bin/sh\necho "$*" >> "${log}"\n`);
+    for (const file of ["shell", "gh", "bb"]) await chmod(join(dir, file), 0o755);
+    const run = (state: string) =>
+      new Promise<void>((resolve, reject) =>
+        execFile(
+          "/bin/bash",
+          ["-c", WATCHER_SCRIPT],
+          {
+            env: {
+              PATH: "/usr/bin:/bin",
+              SHELL: join(dir, "shell"),
+              BB_CLI: join(dir, "bb"),
+              BB_AUTOMATION_ID: "auto-1",
+              BB_PROJECT_ID: "project-1",
+              PR_URL: "https://github.com/owner/repo/pull/123",
+              ENVOY_THREAD: "thread-1",
+              NOTICE: "[PR ready] go",
+              PR_STATE: state,
+            },
+          },
+          (error) => (error ? reject(error) : resolve()),
+        ),
+      );
+    const calls = async () =>
+      (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+    await run("draft");
+    assert.deepEqual(await calls(), []);
+    await run("ready");
+    assert.deepEqual(await calls(), [
+      "thread tell thread-1 [PR ready] go",
+      "automation delete auto-1 --project project-1 --yes",
+    ]);
+    await rm(log);
+    await run("closed");
+    assert.deepEqual(await calls(), ["automation delete auto-1 --project project-1 --yes"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

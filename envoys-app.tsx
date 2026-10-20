@@ -460,7 +460,6 @@ function EnvoyDetails({
   const [name, setName] = useState(envoy.name);
   const [issue, setIssue] = useState(envoy.issue?.url ?? "");
   const [prUrl, setPrUrl] = useState("");
-  const [relaunchPr, setRelaunchPr] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   async function run(work: () => Promise<unknown>) {
@@ -532,9 +531,10 @@ function EnvoyDetails({
         <div className="space-y-2 border-t border-border pt-3">
           <p className="text-sm font-medium">Pull requests</p>
           <p className="text-xs text-muted-foreground">
-            Only attached PRs are checked. Open drafts; mark ready yourself or
-            ask this Envoy. Readiness starts the ready-PR handoff specialist,
-            if one is set in Sages settings.
+            Open drafts; mark ready yourself or ask this Envoy. With a ready-PR
+            handoff specialist set in Sages settings, each attached PR gets a
+            watcher automation owned by the Envoy, which tells the Envoy to hand
+            it off once it is ready. Parking or cancelling removes watchers.
           </p>
           {envoy.prs.map((pr) => (
             <div
@@ -544,60 +544,7 @@ function EnvoyDetails({
               <UrlLink href={pr.url}>
                 {pr.owner}/{pr.repo} #{pr.number}
               </UrlLink>
-              <p className="text-xs text-muted-foreground">
-                {pr.state} ·{" "}
-                {pr.handoff === "started"
-                  ? "PR handoff started"
-                  : pr.watching
-                    ? "Watching readiness"
-                    : "Monitoring stopped"}
-              </p>
-              <ErrorLine error={pr.error} />
-              {pr.handoffThreadId ? (
-                <button
-                  className="text-xs underline"
-                  type="button"
-                  onClick={() => navigate.toThread(pr.handoffThreadId!)}
-                >
-                  Open handoff
-                </button>
-              ) : null}
               <div className="flex gap-2">
-                {pr.error ||
-                (!pr.watching &&
-                  pr.handoff !== "started" &&
-                  !["closed", "merged"].includes(pr.state)) ? (
-                  <Button
-                    className="h-7 text-xs"
-                    disabled={pending || envoy.lifecycle === "cancelled"}
-                    variant="ghost"
-                    onClick={() =>
-                      void run(() =>
-                        rpc.call("envoys_pr", {
-                          id: envoy.id,
-                          url: pr.url,
-                          action: "retry",
-                        }),
-                      )
-                    }
-                  >
-                    {pr.handoff === "pending"
-                      ? "Resume monitoring"
-                      : "Retry handoff"}
-                  </Button>
-                ) : null}
-                {pr.handoff === "dispatching" &&
-                !pr.handoffThreadId &&
-                !pr.watching ? (
-                  <Button
-                    className="h-7 text-xs"
-                    disabled={pending || envoy.lifecycle === "cancelled"}
-                    variant="ghost"
-                    onClick={() => setRelaunchPr(pr.url)}
-                  >
-                    Relaunch handoff
-                  </Button>
-                ) : null}
                 <Button
                   className="h-7 text-xs"
                   disabled={pending}
@@ -643,43 +590,6 @@ function EnvoyDetails({
             Attach PR
           </Button>
         </div>
-        {relaunchPr ? (
-          <div
-            role="alertdialog"
-            aria-label="Confirm handoff relaunch"
-            className="space-y-2 rounded-md border border-border p-3"
-          >
-            <p className="text-sm">
-              Recovery will search again for the original worker. If none is
-              found, launch another? An earlier request may still finish and
-              create a duplicate worker.
-            </p>
-            <div className="flex gap-2">
-              <Button
-                disabled={pending}
-                onClick={() =>
-                  void run(async () => {
-                    await rpc.call("envoys_pr", {
-                      id: envoy.id,
-                      url: relaunchPr,
-                      action: "relaunch",
-                    });
-                    setRelaunchPr(null);
-                  })
-                }
-              >
-                Confirm relaunch
-              </Button>
-              <Button
-                variant="ghost"
-                disabled={pending}
-                onClick={() => setRelaunchPr(null)}
-              >
-                Keep recovering
-              </Button>
-            </div>
-          </div>
-        ) : null}
         <ErrorLine error={error ?? envoy.error} />
         <div className="flex flex-wrap gap-2 border-t border-border pt-3">
           {(
@@ -715,12 +625,11 @@ function EnvoyDetails({
             ))}
         </div>
         <p className="text-xs text-muted-foreground">
-          Parking preserves the workspace and chat. Attached PR monitoring and
-          handoff agents continue. Completing a task also preserves PR
-          follow-up. Cancelling stops readiness monitoring and handoff agents;
-          anything they scheduled elsewhere, such as automations, is managed
-          there. After resuming a cancelled task, open its handoff thread to
-          resume a stopped worker. Sending a user message to a parked
+          Parking preserves the workspace and chat and the Envoy's handoff
+          worker, and removes its PR watchers; resuming restores them.
+          Completing a task keeps its watchers, so a ready PR still reaches the
+          Envoy to hand off. Cancelling stops all of the Envoy's child threads
+          and removes its watchers. Sending a user message to a parked
           or completed task resumes the task; automated notices do not.
         </p>
       </DialogContent>

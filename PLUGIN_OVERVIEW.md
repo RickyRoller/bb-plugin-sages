@@ -34,8 +34,9 @@ one visible BB chat, with an optional name, issue link and specialist lead.
 An ordinary agent leads by default and delegates appropriate work to specialists.
 Git projects start in a new worktree; the native composer controls models and permissions.
 
-Attached PRs start as drafts. If you name a ready-PR handoff specialist in the
-settings, marking a PR ready hands it to that specialist for follow-up, with any
-instructions you set. Without one, or without an attached PR, nothing polls GitHub.
+Attached PRs start as drafts, and the Envoy owns its PR end to end. If you name a
+ready-PR handoff specialist in the settings, each attached PR gets a watcher automation
+owned by the Envoy; marking the PR ready tells the Envoy, which hands it to that
+specialist for follow-up. Parking or cancelling the Envoy removes its watchers.
 Park a task to stop implementation while keeping its workspace and PR follow-up.
 Open the Envoys tab or use the New Envoy command palette action.

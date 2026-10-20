@@ -317,14 +317,6 @@ export default async function plugin(bb: BbPluginApi) {
         "Shell command that installs dependencies in a prepared base checkout (for example npm ci, or bun install --frozen-lockfile). Envoys are asked to run it in their new worktree too. Leave empty to skip installing.",
       default: "",
     },
-    envoyReadyHandoffInstructions: {
-      type: "string",
-      label: "Ready-PR handoff instructions",
-      description:
-        "Extra instructions sent to the ready-PR handoff specialist (chosen below) with each PR, such as your CI and review procedure.",
-      experimental_multiline: true,
-      default: "",
-    },
     envoyPermissionMode: {
       type: "select",
       label: "Envoy permission level",
@@ -363,7 +355,6 @@ export default async function plugin(bb: BbPluginApi) {
       preparedProjects: list(values.envoyPreparedProjects),
       installCommand: values.envoyInstallCommand.trim(),
       handoffSpecialist: preferences.readyHandoffSpecialist,
-      handoffInstructions: values.envoyReadyHandoffInstructions,
       issueHosts: list(values.envoyIssueHosts.toLowerCase()),
       permissionMode: values.envoyPermissionMode as EnvoyConfig["permissionMode"],
     };

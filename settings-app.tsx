@@ -96,8 +96,9 @@ function SagesSettings() {
       <label className="space-y-2 text-sm">
         <span className="font-medium">Ready-PR handoff specialist</span>
         <p className="text-xs text-muted-foreground">
-          Started when an Envoy's attached PR is marked ready for review. With
-          none, attached PRs are listed but never polled.
+          An Envoy hands its PR to this specialist once the PR is marked ready
+          for review; a watcher automation it owns tells it when. With none,
+          attached PRs get no watcher.
         </p>
         <select
           className={SELECT}
