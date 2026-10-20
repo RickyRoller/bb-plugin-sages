@@ -93,6 +93,11 @@ export const envoySchema = z.object({
   error: z.string().nullable(),
   issue: issueSchema.nullable(),
   specialist: z.string().nullable(),
+  /** The sage that started it, which hears how each of its turns ends. */
+  reportTo: z
+    .object({ sageId: z.string(), name: z.string() })
+    .nullable()
+    .default(null),
   prs: z.array(prSchema),
   result: z.string().nullable(),
   createdAt: z.string(),
@@ -151,6 +156,7 @@ export const createSchema = z.object({
   name: z.string().trim().max(80).default(""),
   issueUrl: z.string().trim().max(2000).default(""),
   specialist: z.string().nullable().default(null),
+  reportTo: envoySchema.shape.reportTo,
   request: requestSchema,
 });
 export const envoyRpcContract = defineRpcContract({

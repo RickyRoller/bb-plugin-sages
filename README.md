@@ -37,6 +37,9 @@ the source machine **before** BB creates the worktree: require a clean default b
 fetch origin's current default branch, fast-forward without discarding local commits,
 and run `envoyInstallCommand` (for example `npm ci` or `bun install --frozen-lockfile`)
 in an interactive login shell, so the PATH and version managers your shell sets up apply. An empty command skips installing.
+A sandboxed agent (for example Codex in `auto`) must be allowed to write the package
+manager's cache too, or the worktree install fails; for Bun, add `~/.bun/install/cache`
+to the provider's writable roots.
 The worktree is pinned to the prepared commit. Configured projects require a new
 worktree from the default branch; checkout reuse and explicit branch overrides are
 rejected. Other projects keep native BB provisioning. The Worktree plugin must be enabled.
@@ -88,7 +91,10 @@ Anything a handoff worker scheduled elsewhere, such as automations, is managed t
 
 A sage starts one with its `sage_envoy(task, project?, name?, issueUrl?,
 specialist?, requestId?)` tool, which takes a project id or name and creates
-through the same path as the CLI. `bb sages envoy --help` prints every command
+through the same path as the CLI. Such an Envoy records the sage in `reportTo`:
+each time its agent ends a turn (or fails), its last message reaches that
+sage's chat as `[Envoy <name>] …`, and its launch instructions say so, so it
+never needs a sage's short-lived turn thread as a return address. `bb sages envoy --help` prints every command
 and flag.
 
 ```sh
@@ -216,6 +222,7 @@ The remaining fields:
 | `envoyPreparedProjects` | empty | Project IDs whose base checkout is fast-forwarded before each new Envoy. |
 | `envoyInstallCommand` | empty | Shell command run in a prepared checkout, and asked of each new worktree. |
 | `envoyReadyHandoffInstructions` | empty | Extra instructions sent to that specialist with each PR. |
+| `envoyPermissionMode` | `full` | Permission level a new Envoy starts in (Full Access, Auto or Accept Edits), unless explicitly chosen in the New Envoy composer. |
 | `envoyIssueHosts` | empty | Hostnames allowed for issue links; empty accepts any https link. |
 
 ## UI components

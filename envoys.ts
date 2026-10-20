@@ -44,7 +44,15 @@ export type EnvoyTask = {
   issueUrl?: string;
   specialist?: string;
   requestId?: string;
+  /** The sage that started it, to report each turn's end to. */
+  reportTo?: { sageId: string; name: string };
 };
+/** How an Envoy's turn ended, for the sage that started it. */
+export type EnvoyReport = (
+  envoy: Envoy,
+  outcome: "finished" | "failed",
+  text: string,
+) => void;
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 // Only structured validation/rejection responses establish that no spawn committed.
@@ -69,6 +77,8 @@ export type EnvoyConfig = {
   handoffInstructions: string;
   /** Hostnames allowed for issue links; empty allows any. */
   issueHosts: string[];
+  /** The permission mode an Envoy starts in unless explicitly chosen. */
+  permissionMode: "accept-edits" | "auto" | "full";
 };
 export const defaultEnvoyConfig: EnvoyConfig = {
   preparedProjects: [],
@@ -76,6 +86,7 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   handoffSpecialist: "",
   handoffInstructions: "",
   issueHosts: [],
+  permissionMode: "full",
 };
 
 function policy(handoff: string) {
@@ -90,6 +101,7 @@ All pull requests you open must be DRAFT (gh pr create --draft). Immediately aft
 export async function registerEnvoys(
   bb: BbPluginApi,
   config: () => Promise<EnvoyConfig> = async () => defaultEnvoyConfig,
+  report: EnvoyReport = () => {},
 ) {
   // configure() is synchronous, so it uses the settings as last read.
   let lastConfig = defaultEnvoyConfig;
@@ -261,6 +273,11 @@ export async function registerEnvoys(
       available === null
         ? "Specialists are unavailable; report this limitation when delegation is needed."
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
+      ...(envoy.reportTo
+        ? [
+            `You were started by the sage "${envoy.reportTo.name}". Whenever you end a turn, your last message goes to it automatically, so end each turn with what it needs: the draft PR link, a blocker or decision you need, or that the work is done. Do not try to message it any other way.`,
+          ]
+        : []),
       ...(launch.lead ? [launch.lead.prompt] : []),
     ].join("\n\n");
     const execution = { ...launch.request };
@@ -296,6 +313,11 @@ export async function registerEnvoys(
     ) {
       execution.reasoningLevel = launch.lead.reasoningLevel;
       sources.reasoningLevel = "explicit";
+    }
+    // An explicit choice in the composer wins; otherwise the setting applies.
+    if (sources.permissionMode !== "explicit") {
+      execution.permissionMode = settings.permissionMode;
+      sources.permissionMode = "explicit";
     }
     execution.executionInputSources = sources;
     // Preparation failures cannot have spawned a thread and are safe to retry.
@@ -421,6 +443,7 @@ export async function registerEnvoys(
         error: null,
         issue,
         specialist: input.specialist,
+        reportTo: input.reportTo,
         prs: [],
         result: null,
         createdAt: existing?.createdAt ?? now,
@@ -448,6 +471,7 @@ export async function registerEnvoys(
         name: task.name,
         issueUrl: task.issueUrl,
         specialist: task.specialist,
+        reportTo: task.reportTo ?? null,
         request: {
           projectId: task.projectId,
           input: [{ type: "text", text: task.task, mentions: [] }],
@@ -1075,10 +1099,17 @@ export async function registerEnvoys(
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     const envoy = [...records.values()].find((e) => e.threadId === thread.id);
-    if (envoy)
+    if (envoy) {
       update(envoy.id, {
         error: error ?? "The task agent failed; retry from its BB thread.",
       });
+      if (envoy.reportTo) report(envoy, "failed", error ?? "no error given");
+    }
+  });
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    const envoy = [...records.values()].find((e) => e.threadId === thread.id);
+    if (envoy?.reportTo)
+      report(envoy, "finished", lastAssistantText ?? "(no final message)");
   });
   bb.onDispose(() => {
     disposed = true;

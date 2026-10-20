@@ -48,6 +48,7 @@ async function setup(
   } = {},
 ) {
   let state = "draft";
+  const reports: { name: string; outcome: string; text: string }[] = [];
   let spawnCount = 0;
   let handoffCount = 0;
   const threads = new Map<string, ReturnType<typeof makeThreadResponse>>();
@@ -181,7 +182,8 @@ async function setup(
     handoffSpecialist: options.noHandoff ? "" : "ready-pr",
     handoffInstructions: "Check CI, then remind reviewers.",
     issueHosts: options.issueHosts ?? [],
-  }));
+    permissionMode: "full",
+  }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }));
   async function sweep() {
     const service = harness.behavior.runService("envoy-recovery");
     await service.done;
@@ -201,6 +203,7 @@ async function setup(
       state = next;
     },
     counts: () => ({ spawnCount, handoffCount }),
+    reports,
   };
 }
 
@@ -872,6 +875,62 @@ test("the CLI documents create's flags and creates through the shared task path"
     assert.equal(s.counts().spawnCount, 1);
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as any;
     assert.equal(spawn.environment.workspace.type, "managed-worktree");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("an Envoy started for a sage reports each turn's end to it, and others stay quiet", async () => {
+  const s = await setup();
+  try {
+    const quiet = await s.create();
+    const reporting = await s.helpers.createTask({
+      task: "Fix the search filter",
+      projectId: "project-1",
+      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+    });
+    assert.deepEqual(reporting.reportTo, { sageId: "sage-1", name: "Work Allocator" });
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+    assert.match(spawn.input[0].text, /started by the sage "Work Allocator"/);
+    for (const envoy of [quiet, reporting])
+      await s.harness.behavior.emitThreadEvent("thread.idle", {
+        thread: s.threads.get(envoy.threadId)!,
+        lastAssistantText: "Blocked on install",
+      } as any);
+    assert.deepEqual(s.reports, [
+      { name: "Fix the search filter", outcome: "finished", text: "Blocked on install" },
+    ]);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("the permission setting applies unless the composer chose one explicitly", async () => {
+  const s = await setup();
+  try {
+    await s.helpers.createTask({ task: "From a sage", projectId: "project-1" });
+    await s.harness.behavior.callRpc("envoys_create", {
+      ...request,
+      requestId: "preference",
+      request: {
+        ...request.request,
+        permissionMode: "auto",
+        executionInputSources: { permissionMode: "client-preference" },
+      },
+    });
+    await s.harness.behavior.callRpc("envoys_create", {
+      ...request,
+      requestId: "explicit",
+      request: {
+        ...request.request,
+        permissionMode: "accept-edits",
+        executionInputSources: { permissionMode: "explicit" },
+      },
+    });
+    const modes = s.harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .map((call) => (call[0] as any).permissionMode);
+    assert.deepEqual(modes, ["full", "full", "accept-edits"]);
   } finally {
     await s.harness.lifecycle.dispose();
   }

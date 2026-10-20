@@ -10,7 +10,8 @@ import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
-import { ENVOY_USAGE, registerEnvoys } from "./envoys.ts";
+import { ENVOY_USAGE, registerEnvoys, type EnvoyConfig } from "./envoys.ts";
+import type { Envoy } from "./envoy-contract.ts";
 import { MissingCli, runDirect } from "./harness.ts";
 import {
   COMPACTION_PROMPT,
@@ -324,6 +325,19 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_multiline: true,
       default: "",
     },
+    envoyPermissionMode: {
+      type: "select",
+      label: "Envoy permission level",
+      description:
+        "The permission level a new Envoy starts in, unless you pick one explicitly in the New Envoy composer. Full Access runs without a sandbox, so installs and builds can use shared caches.",
+      options: ["full", "auto", "accept-edits"],
+      experimental_optionLabels: {
+        full: "Full Access",
+        auto: "Auto",
+        "accept-edits": "Accept Edits",
+      },
+      default: "full",
+    },
     envoyIssueHosts: {
       type: "string",
       label: "Envoy issue hosts",
@@ -351,8 +365,9 @@ export default async function plugin(bb: BbPluginApi) {
       handoffSpecialist: preferences.readyHandoffSpecialist,
       handoffInstructions: values.envoyReadyHandoffInstructions,
       issueHosts: list(values.envoyIssueHosts.toLowerCase()),
+      permissionMode: values.envoyPermissionMode as EnvoyConfig["permissionMode"],
     };
-  });
+  }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text));
 
   // bb.agents.configure is synchronous, so sages are served from memory and
   // written through to storage.
@@ -1081,6 +1096,32 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`could not deliver a specialist report: ${errorText(cause)}`),
     );
   }
+  /** Brings how an Envoy's turn ended to the sage that started it. */
+  function reportEnvoy(envoy: Envoy, outcome: string, text: string) {
+    const sage = sages.find((each) => each.id === envoy.reportTo?.sageId);
+    if (sage === undefined) return;
+    // A closed acolyte's Envoy reports to its main chat instead.
+    const target =
+      sage.archivedAt !== null && sage.parentId !== null
+        ? findSage(sage.parentId)
+        : sage;
+    const report = `[Envoy ${envoy.name}] ${outcome} a turn (thread ${envoy.threadId}):\n${text}`;
+    serial(target.id, async () => {
+      try {
+        await deliver(
+          target.id,
+          envoy.threadId,
+          `Envoy ${envoy.name} ${outcome} a turn`,
+          report,
+        );
+      } catch (cause) {
+        chatOf(target.id).append("work", report);
+        throw cause;
+      }
+    }).catch((cause) =>
+      bb.log.warn(`could not deliver an Envoy report: ${errorText(cause)}`),
+    );
+  }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
     workerDone(thread.id, "finished", async (name) => {
       const text =
@@ -1467,7 +1508,6 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     execute: ({ task, project, name, issueUrl, specialist, requestId }, { threadId }) =>
       toolResult(async () => {
-        await sageOfTurn(threadId);
         let projectId = (await bb.sdk.threads.get({ threadId })).projectId;
         if (project) {
           const projects = await bb.sdk.projects.list({ includePersonal: true });
@@ -1481,7 +1521,9 @@ export default async function plugin(bb: BbPluginApi) {
             );
           projectId = match.id;
         }
+        const sage = await sageOfTurn(threadId);
         const envoy = await envoys.createTask({
+          reportTo: { sageId: sage.id, name: sage.name },
           task,
           projectId,
           name,
@@ -1493,7 +1535,7 @@ export default async function plugin(bb: BbPluginApi) {
           `Envoy "${envoy.name}" (${envoy.id}): creation ${envoy.creation}${envoy.error ? ` — ${envoy.error}` : ""}.`,
           envoy.threadId === null
             ? `No thread yet; check it with bb sages envoy show ${envoy.id}, and recover with bb sages envoy recover ${envoy.id}.`
-            : `Its thread: @thread:${envoy.threadId}. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
+            : `Its thread: @thread:${envoy.threadId}. Each time it ends a turn, its last message reaches this chat as a message starting "[Envoy ${envoy.name}]"; never wait for it. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
         ].join("\n");
       }),
   });

@@ -9,7 +9,7 @@ const VIEW = `Each message has a kind:
 - sage: the sage's replies
 - tool: the sage's tool calls
 - echo: tool results
-- work: a specialist's report, starting "[name]"
+- work: a specialist's or an Envoy's report, starting "[name]" or "[Envoy"
 - acolyte: an acolyte (a sage under the sage) opened, messaged, closed with
   its summary, archived, or moved, starting "[acolyte"
 
@@ -171,4 +171,7 @@ workspace, hand off to a specialist instead.
 The Envoy sees none of this chat, so the task must stand alone: the goal, the
 relevant paths and facts, constraints, how to verify it, and what done looks
 like. Name the project it works in. Tell the user its thread, as
-@thread:<id>. Check on it later with bb sages envoy show <id>.`;
+@thread:<id>. Each time it ends a turn (a draft PR opened, a blocker, done),
+its last message reaches this chat as a message starting "[Envoy <name>]": do
+not give it any other way to reach you. To answer it, use bb thread tell on its
+thread.`;
