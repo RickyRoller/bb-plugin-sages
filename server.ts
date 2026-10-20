@@ -1096,13 +1096,13 @@ export default async function plugin(bb: BbPluginApi) {
       sage.archivedAt !== null && sage.parentId !== null
         ? findSage(sage.parentId)
         : sage;
-    const report = `[Envoy ${envoy.name}] ${outcome} a turn (thread ${envoy.threadId}):\n${text}`;
+    const report = `[Envoy ${envoy.name}] ${outcome} (thread ${envoy.threadId}):\n${text}`;
     serial(target.id, async () => {
       try {
         await deliver(
           target.id,
           envoy.threadId,
-          `Envoy ${envoy.name} ${outcome} a turn`,
+          `Envoy ${envoy.name} ${outcome}`,
           report,
         );
       } catch (cause) {
@@ -1526,7 +1526,7 @@ export default async function plugin(bb: BbPluginApi) {
           `Envoy "${envoy.name}" (${envoy.id}): creation ${envoy.creation}${envoy.error ? ` — ${envoy.error}` : ""}.`,
           envoy.threadId === null
             ? `No thread yet; check it with bb sages envoy show ${envoy.id}, and recover with bb sages envoy recover ${envoy.id}.`
-            : `Its thread: @thread:${envoy.threadId}. Each time it ends a turn, its last message reaches this chat as a message starting "[Envoy ${envoy.name}]"; never wait for it. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
+            : `Its thread: @thread:${envoy.threadId}. When it is blocked or needs a decision and the user isn't working with it directly, it reports to this chat with a message starting "[Envoy ${envoy.name}]"; answer with bb thread tell ${envoy.threadId}. Never wait for it. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
         ].join("\n");
       }),
   });

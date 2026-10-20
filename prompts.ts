@@ -171,7 +171,8 @@ workspace, hand off to a specialist instead.
 The Envoy sees none of this chat, so the task must stand alone: the goal, the
 relevant paths and facts, constraints, how to verify it, and what done looks
 like. Name the project it works in. Tell the user its thread, as
-@thread:<id>. Each time it ends a turn (a draft PR opened, a blocker, done),
-its last message reaches this chat as a message starting "[Envoy <name>]": do
-not give it any other way to reach you. To answer it, use bb thread tell on its
-thread.`;
+@thread:<id>. It owns its work end to end and reports to this chat, as a
+message starting "[Envoy <name>]", only when it is blocked or needs a decision
+while the user isn't working with it directly: do not give it any other way to
+reach you. Answer it with bb thread tell on its thread. Check on its progress
+with bb sages envoy show <id>.`;

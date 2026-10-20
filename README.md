@@ -86,11 +86,16 @@ These actions do not delete the workspace; cleanup remains a separate native BB 
 
 A sage starts one with its `sage_envoy(task, project?, name?, issueUrl?,
 specialist?, requestId?)` tool, which takes a project id or name and creates
-through the same path as the CLI. Such an Envoy records the sage in `reportTo`:
-each time its agent ends a turn (or fails), its last message reaches that
-sage's chat as `[Envoy <name>] …`, and its launch instructions say so, so it
-never needs a sage's short-lived turn thread as a return address. `bb sages envoy --help` prints every command
-and flag.
+through the same path as the CLI. Such an Envoy records the sage in `reportTo` and
+gets an `envoy_report` tool. It reports to the sage, as `[Envoy <name>] needs a
+decision …`, only when it is blocked or needs a decision while the user isn't in the
+conversation; the sage answers with `bb thread tell` on its thread. The plugin enforces
+that: its message hook notes whether the user started or joined the current turn
+(the watcher's `[PR ready]` message, child-thread completions and the sage's replies
+don't count), and the tool refuses during such turns, so a user working with the Envoy
+is asked directly. Routine progress is never reported. A failed Envoy thread is
+reported as `[Envoy <name>] failed …`, again only when the user wasn't in that turn.
+`bb sages envoy --help` prints every command and flag.
 
 ```sh
 bb sages envoy create --project <id> --task 'Fix login crash' --issue https://tracker.example.com/issue/ABC-123

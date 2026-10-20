@@ -640,26 +640,86 @@ test("the CLI documents create's flags and creates through the shared task path"
   }
 });
 
-test("an Envoy started for a sage reports each turn's end to it, and others stay quiet", async () => {
+test("an Envoy reports to its sage only when it needs a decision and the user isn't in the turn", async () => {
   const s = await setup();
   try {
     const quiet = await s.create();
-    const reporting = await s.helpers.createTask({
+    const envoy = await s.helpers.createTask({
       task: "Fix the search filter",
       projectId: "project-1",
       reportTo: { sageId: "sage-1", name: "Work Allocator" },
     });
-    assert.deepEqual(reporting.reportTo, { sageId: "sage-1", name: "Work Allocator" });
+    assert.deepEqual(envoy.reportTo, { sageId: "sage-1", name: "Work Allocator" });
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
-    assert.match(spawn.input[0].text, /started by the sage "Work Allocator"/);
-    for (const envoy of [quiet, reporting])
-      await s.harness.behavior.emitThreadEvent("thread.idle", {
-        thread: s.threads.get(envoy.threadId)!,
-        lastAssistantText: "Blocked on install",
-      } as any);
-    assert.deepEqual(s.reports, [
-      { name: "Fix the search filter", outcome: "finished", text: "Blocked on install" },
-    ]);
+    assert.match(spawn.input[0].text, /started by the sage "Work Allocator"\. When you are blocked or need a decision while the user is not in the conversation/);
+    const tools = (threadId: string, envoyId: string) =>
+      s.helpers.configure(
+        makePluginAgentConfigurationContext({
+          thread: { id: threadId },
+          pluginMetadata: { envoyId },
+        }),
+      ).tools;
+    assert.deepEqual(tools(envoy.threadId!, envoy.id), ["envoy_attach_pr", "envoy_report"]);
+    assert.deepEqual(tools(quiet.threadId!, quiet.id), ["envoy_attach_pr"]);
+
+    // Ending a turn reports nothing on its own.
+    await s.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: s.threads.get(envoy.threadId!)!,
+      lastAssistantText: "Updated the PR",
+    } as any);
+    assert.equal(s.reports.length, 0);
+
+    const hook = s.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const dispatch = (text: string, initiator: "user" | "system" | "agent", attempt = "start-turn") =>
+      hook(
+        makeMessageDispatchHookContext({
+          thread: s.threads.get(envoy.threadId!)!,
+          initiator,
+          attempt,
+          input: { text, blocks: [{ type: "text", text, mentions: [] }] },
+        } as any),
+      );
+    const ask = () =>
+      s.harness.behavior.callAgentTool(
+        "envoy_report",
+        { message: "Should invisible actors count toward the limit?" },
+        { threadId: envoy.threadId! },
+      );
+
+    // A turn the user started: ask them, not the sage.
+    await dispatch("Make the recommended update", "user");
+    assert.match(String(await ask()), /Not sent: the user is in this conversation/);
+    assert.equal(s.reports.length, 0);
+
+    // A child thread finishing starts an automated turn: the sage hears it.
+    await dispatch("[bb system] @thread:child completed", "system");
+    assert.match(String(await ask()), /Sent to the sage "Work Allocator"/);
+    // The user joining that running turn brings them into it.
+    await dispatch("Wait, one more thing", "user", "join-turn");
+    assert.match(String(await ask()), /Not sent/);
+
+    // The watcher's notice arrives as a user message but is automated.
+    await dispatch("[PR ready] https://github.com/owner/repo/pull/1 is marked ready", "user");
+    assert.match(String(await ask()), /Sent to the sage/);
+    assert.deepEqual(
+      s.reports.map((r) => r.outcome),
+      ["needs a decision", "needs a decision"],
+    );
+
+    // A failure is reported only when the user wasn't in the turn.
+    await s.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: s.threads.get(envoy.threadId!)!,
+      error: "provider crashed",
+    } as any);
+    await dispatch("Try again", "user");
+    await s.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: s.threads.get(envoy.threadId!)!,
+      error: "crashed again",
+    } as any);
+    assert.deepEqual(
+      s.reports.map((r) => [r.outcome, r.text]).slice(2),
+      [["failed", "provider crashed"]],
+    );
   } finally {
     await s.harness.lifecycle.dispose();
   }

@@ -20,6 +20,7 @@ import {
 } from "./envoy-contract.ts";
 
 const PR_TOOL = "envoy_attach_pr";
+const REPORT_TOOL = "envoy_report";
 const WATCHER_PREFIX = "Envoy PR watcher: ";
 /** Starts the notice a watcher sends, so it reaches a completed Envoy. */
 const READY_MARKER = "[PR ready]";
@@ -63,10 +64,10 @@ export type EnvoyTask = {
   /** The sage that started it, to report each turn's end to. */
   reportTo?: { sageId: string; name: string };
 };
-/** How an Envoy's turn ended, for the sage that started it. */
+/** What an Envoy tells the sage that started it. */
 export type EnvoyReport = (
   envoy: Envoy,
-  outcome: "finished" | "failed",
+  outcome: "needs a decision" | "failed",
   text: string,
 ) => void;
 const errorText = (error: unknown) =>
@@ -138,6 +139,8 @@ export async function registerEnvoys(
   const host = bb.hosts.experimental_client({ contract: envoyHostContract });
   const controller = new AbortController();
   const queues = new Map<string, Promise<unknown>>();
+  /** Envoy threads whose current turn the user started or joined. */
+  const userTurns = new Set<string>();
   function serial<T>(id: string, work: () => Promise<T>): Promise<T> {
     const next = (queues.get(id) ?? Promise.resolve()).then(work, work);
     queues.set(id, next);
@@ -265,7 +268,7 @@ export async function registerEnvoys(
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
       ...(envoy.reportTo
         ? [
-            `You were started by the sage "${envoy.reportTo.name}". Whenever you end a turn, your last message goes to it automatically, so end each turn with what it needs: the draft PR link, a blocker or decision you need, or that the work is done. Do not try to message it any other way.`,
+            `You were started by the sage "${envoy.reportTo.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress, and do not try to reach the sage any other way.`,
           ]
         : []),
       ...(launch.lead ? [launch.lead.prompt] : []),
@@ -765,6 +768,28 @@ export async function registerEnvoys(
       return `Attached ${pr.url}. ${watched ? `A watcher automation you own checks it every 2 minutes: once you or the user marks it ready, you get a message starting "${READY_MARKER}" telling you to hand it off to ${handoffSpecialist}.` : handoffSpecialist ? "It is not watched while this Envoy is parked." : "No ready-PR handoff specialist is configured, so it is not watched."}`;
     },
   });
+  bb.agents.registerTool({
+    name: REPORT_TOOL,
+    description:
+      "Tell the sage that started this Envoy that you are blocked or need a decision. Only while the user is not in the conversation; it refuses during turns the user started.",
+    parameters: z.object({
+      message: z
+        .string()
+        .trim()
+        .min(1)
+        .max(20_000)
+        .describe("What you need and why, with the options you see"),
+    }),
+    execute: async ({ message }, { threadId }) => {
+      const envoy = [...records.values()].find((e) => e.threadId === threadId);
+      if (!envoy?.reportTo)
+        throw new Error("This Envoy was not started by a sage; ask the user");
+      if (userTurns.has(threadId))
+        return "Not sent: the user is in this conversation, so ask them directly.";
+      report(envoy, "needs a decision", message);
+      return `Sent to the sage "${envoy.reportTo.name}". Its reply arrives in this thread; end your turn rather than waiting for it.`;
+    },
+  });
   // Startup recovery and checking are dormant until actual records need work.
   bb.background.service("envoy-recovery", {
     async start(signal) {
@@ -798,6 +823,15 @@ export async function registerEnvoys(
     const envoy = [...records.values()].find(
       (e) => e.threadId === context.thread.id,
     );
+    if (envoy) {
+      // The watcher's notice arrives as a user message but is automated.
+      const fromUser =
+        context.initiator === "user" &&
+        !context.input.text.trimStart().startsWith(READY_MARKER);
+      if (fromUser) userTurns.add(context.thread.id);
+      else if (context.attempt === "start-turn")
+        userTurns.delete(context.thread.id);
+    }
     if (
       !envoy ||
       envoy.lifecycle === "active" ||
@@ -858,7 +892,8 @@ export async function registerEnvoys(
       update(envoy.id, {
         error: error ?? "The task agent failed; retry from its BB thread.",
       });
-      if (envoy.reportTo) report(envoy, "failed", error ?? "no error given");
+      if (envoy.reportTo && !userTurns.has(thread.id))
+        report(envoy, "failed", error ?? "no error given");
     }
   });
   // An archived (or deleted) Envoy thread leaves no watcher behind.
@@ -868,11 +903,6 @@ export async function registerEnvoys(
       void unwatch(envoy).catch((error) =>
         bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
       );
-  });
-  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
-    const envoy = [...records.values()].find((e) => e.threadId === thread.id);
-    if (envoy?.reportTo)
-      report(envoy, "finished", lastAssistantText ?? "(no final message)");
   });
   bb.onDispose(() => {
     controller.abort();
@@ -884,7 +914,11 @@ export async function registerEnvoys(
       const envoy = records.get(String(context.pluginMetadata.envoyId ?? ""));
       return envoy &&
         (envoy.threadId === null || envoy.threadId === context.thread.id)
-        ? { tools: [PR_TOOL], skills: [], instructions: policy(lastConfig.handoffSpecialist) }
+        ? {
+            tools: envoy.reportTo ? [PR_TOOL, REPORT_TOOL] : [PR_TOOL],
+            skills: [],
+            instructions: policy(lastConfig.handoffSpecialist),
+          }
         : { tools: [], skills: [] };
     },
     async runCli(argv: string[], ctx: PluginCliContext) {
