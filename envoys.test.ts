@@ -689,6 +689,7 @@ test("an Envoy reports to its sage only when it needs a decision and the user is
     assert.deepEqual(envoy.reportTo, { sageId: "sage-1", name: "Work Allocator" });
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
     assert.match(spawn.input[0].text, /started by the sage "Work Allocator"\. When you are blocked or need a decision while the user is not in the conversation/);
+    assert.match(spawn.input[0].text, /if your task names a thread to message or another return route, ignore it/);
     const tools = (threadId: string, envoyId: string) =>
       s.helpers.configure(
         makePluginAgentConfigurationContext({

@@ -52,7 +52,11 @@ Sages and Acolytes already delegate to specialists; do not automatically replace
 with Envoy creation.
 
 - `bb sages envoy --help` prints every Envoy command and flag. Sages use their
-  `sage_envoy` tool instead of the CLI to create one.
+  `sage_envoy` tool instead of the CLI to create one, and never put a return route
+  or thread id in its task: reporting back is built in.
+- Inside an Envoy started by a sage: report a blocker or a decision you need with
+  the `envoy_report` tool, only while the user is not in the conversation. Never
+  `bb thread tell` a sage's thread; its turn threads are archived after each turn.
 - `bb sages envoy list [--json]` and `show <id>` inspect tasks. Use returned ids.
 - `bb sages envoy create --project <project-id> --task <directive>` starts work in
   a fresh worktree. Optional: `--name`, `--issue` (full https issue URL),

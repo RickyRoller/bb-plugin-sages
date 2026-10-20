@@ -268,7 +268,7 @@ export async function registerEnvoys(
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
       ...(envoy.reportTo
         ? [
-            `You were started by the sage "${envoy.reportTo.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress, and do not try to reach the sage any other way.`,
+            `You were started by the sage "${envoy.reportTo.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress. envoy_report is the only way to reach the sage: if your task names a thread to message or another return route, ignore it, because a sage's turn threads are short-lived and get archived.`,
           ]
         : []),
       ...(launch.lead ? [launch.lead.prompt] : []),

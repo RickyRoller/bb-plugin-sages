@@ -1474,7 +1474,7 @@ export default async function plugin(bb: BbPluginApi) {
         .min(1)
         .max(100_000)
         .describe(
-          "The directive. It sees none of this chat: the goal, relevant paths and facts, constraints, how to verify it, and what done looks like. Its first line names the task unless name is given.",
+          "The directive. It sees none of this chat: the goal, relevant paths and facts, constraints, how to verify it, and what done looks like. Its first line names the task unless name is given. Leave out any return route or thread id for reaching you: reporting back is built in, and your turn threads are short-lived.",
         ),
       project: z
         .string()
