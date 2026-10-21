@@ -21,6 +21,8 @@ const PARALLEL = 8;
 /** A message's node waits until fewer than this many before it are unbuilt. */
 const WINDOW = 8;
 const TRIES = 5;
+/** How long a failed call waits before it is tried again. */
+const RETRY_MS = 60_000;
 const UNBUILT = "(not summarized yet: zoom it)";
 
 export type Kind = "user" | "sage" | "tool" | "echo" | "work" | "acolyte";
@@ -149,6 +151,8 @@ export class Chat {
   private merges: Ref[];
   private failedMessages = new Set<number>();
   private failedMerges: Ref[] = [];
+  /** Tries failed calls again after a pause, so a quiet chat still heals. */
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private inflight = new Set<number>();
   private running = 0;
   private sizes = new Map<number, number>();
@@ -257,12 +261,19 @@ export class Chat {
     })();
     if (ids.length > 0) {
       // A failed call is tried again at the next message.
-      this.failedMessages.clear();
-      this.merges.push(...this.failedMerges.splice(0));
-      this.pump();
+      this.retryFailed();
       this.onChange();
     }
     return ids;
+  }
+
+  /** Queues the failed calls again. */
+  private retryFailed(): void {
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.failedMessages.clear();
+    this.merges.push(...this.failedMerges.splice(0));
+    this.pump();
   }
 
   /** The view every turn starts from. Render it before logging the turn's message. */
@@ -322,6 +333,7 @@ export class Chat {
 
   /** Stops background calls. The chat must not be used afterwards. */
   dispose(): void {
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.abort.abort();
     this.waiters.splice(0).forEach((resolve) => resolve());
   }
@@ -447,6 +459,10 @@ export class Chat {
               this.inflight.delete(ref[1]);
               this.failedMessages.add(ref[1]);
             } else this.failedMerges.push(ref);
+            this.retryTimer ??= setTimeout(() => {
+              this.retryTimer = null;
+              this.retryFailed();
+            }, RETRY_MS);
             this.onChange(error);
           },
         )

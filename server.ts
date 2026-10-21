@@ -50,6 +50,11 @@ const sageSchema = z.object({
   archivedAt: z.string().nullable().default(null),
   /** Whether the acolyte's closing summary is being written. */
   closing: z.boolean().default(false),
+  /** A message the user sent that could not be sent, by its request id. */
+  unsent: z
+    .object({ requestId: z.string(), error: z.string() })
+    .nullable()
+    .default(null),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -142,10 +147,19 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string() }),
     output: z.object({ removed: z.boolean() }),
   },
-  /** Starts a turn: one user message, answered in a fresh thread. */
+  /**
+   * Sends one user message: a fresh turn, or into the running one. Answers
+   * within a few seconds even when starting the turn takes longer; the turn
+   * then starts in the background, and a failure lands in `unsent`. A
+   * request id already sent is not sent again, so a client may retry.
+   */
   sages_send: {
-    input: z.object({ id: z.string(), request: turnRequestSchema }),
-    output: sageSchema,
+    input: z.object({
+      id: z.string(),
+      request: turnRequestSchema,
+      requestId: z.string().min(1).max(100).optional(),
+    }),
+    output: z.object({ sage: sageSchema, pending: z.boolean() }),
   },
   /** Puts sages in this order; ids left out keep their place after these. */
   sages_reorder: {
@@ -193,6 +207,17 @@ export const rpcContract = defineRpcContract({
     output: sageSchema,
   },
 });
+
+/** How long a send waits for the chat's summaries before going without. */
+const SETTLE_WAIT_MS = 15_000;
+/**
+ * How long sages_send waits for the turn before answering. Kept well under
+ * the time a remote connection gives a request, so a slow start never looks
+ * like a failure to the client.
+ */
+const SEND_ANSWER_MS = 4_000;
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Realtime channel app.tsx listens on. */
 const SAGES_CHANGED = "sages-changed";
@@ -562,6 +587,9 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  /** Request ids of the user's messages, sent or being sent. */
+  const requests = new Set<string>();
+
   // One writer per chat: a sage's sends and its thread's events are handled
   // one at a time, in order.
   const queues = new Map<string, Promise<unknown>>();
@@ -666,8 +694,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const chat = chatOf(sageId);
     // Every message before this one is summarized first, so the view holds
-    // no placeholder for work the compactor is about to finish.
-    await chat.settled();
+    // no placeholder for work the compactor is about to finish; but a slow
+    // or failing compactor never holds a message up for long.
+    await Promise.race([chat.settled(), sleep(SETTLE_WAIT_MS)]);
     // The view is rendered before the new message is logged: the message
     // goes whole after it. Per-turn state follows the view, so the view
     // stays a stable prefix from one turn to the next.
@@ -708,6 +737,7 @@ export default async function plugin(bb: BbPluginApi) {
       running: true,
       turnStart,
       error: null,
+      unsent: null,
       defaults: selection,
     });
   }
@@ -1207,7 +1237,37 @@ export default async function plugin(bb: BbPluginApi) {
       return updateSage(id, patch);
     },
     sages_remove: async ({ id }) => ({ removed: await removeSage(id) }),
-    sages_send: ({ id, request }) => serial(id, () => send(id, request)),
+    sages_send: async ({ id, request, requestId }) => {
+      findSage(id);
+      if (requestId !== undefined && requests.has(requestId)) {
+        return { sage: findSage(id), pending: false };
+      }
+      if (requestId !== undefined) {
+        requests.add(requestId);
+        // Remembers the latest ids only: enough to absorb a client's retry.
+        if (requests.size > 500) {
+          requests.delete(requests.values().next().value!);
+        }
+      }
+      const sent = serial(id, () => send(id, request)).then(
+        () => true,
+        async (cause: unknown) => {
+          // Failed, it was never sent: the client may send it again.
+          if (requestId !== undefined) requests.delete(requestId);
+          if (requestId === undefined) throw cause;
+          await updateSage(id, {
+            unsent: { requestId, error: errorText(cause) },
+          }).catch(() => {});
+          throw cause;
+        },
+      );
+      const done = await Promise.race([
+        sent,
+        sleep(SEND_ANSWER_MS).then(() => false),
+      ]);
+      if (!done) sent.catch(() => {});
+      return { sage: findSage(id), pending: !done };
+    },
     sages_reorder: async ({ ids }) => {
       const rank = new Map(ids.map((id, index) => [id, index]));
       const ordered = [...sages].sort(

@@ -7,7 +7,9 @@
 // chat, bb's NewThreadComposer sends the next message, and bb's ThreadChat
 // shows the turn while it runs.
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -489,7 +491,7 @@ function AcolyteMarker({
 }) {
   const navigate = useBbNavigate();
   const match = ACOLYTE_MARK.exec(text);
-  if (match === null) return <Markdown content={text} />;
+  if (match === null) return <ChatMarkdown content={text} />;
   const [, id = "", event, title] = match;
   const acolyte = acolytes.get(id);
   const body = markerBody(text);
@@ -519,7 +521,7 @@ function AcolyteMarker({
           </>
         }
       >
-        <Markdown content={body} />
+        <ChatMarkdown content={body} />
       </Disclosure>
     );
   }
@@ -534,7 +536,7 @@ function AcolyteMarker({
           </span>
         }
       >
-        <Markdown content={body} />
+        <ChatMarkdown content={body} />
       </Disclosure>
     );
   }
@@ -572,7 +574,7 @@ function AcolyteOpening({ text }: { text: string }) {
         </span>
       }
     >
-      <Markdown content={markerBody(text)} />
+      <ChatMarkdown content={markerBody(text)} />
     </Disclosure>
   );
 }
@@ -745,6 +747,76 @@ function NewAcolyteForm({
   );
 }
 
+// --- Thread mentions ---
+// bb's chats show "@thread:<id>" as a pill with the thread's title; its
+// Markdown component, which draws the logged chat, does not. So the logged
+// chat resolves the mentions itself and writes each one as a link to the
+// thread, which the chat's styles draw as a pill.
+
+const THREAD_MENTION = /(^|[^\p{L}\p{N}_.+-])@thread:([A-Za-z0-9_-]+)/gu;
+/** Code spans and blocks, where a mention stays as written. */
+const CODE = /(```[\s\S]*?```|`[^`\n]*`)/u;
+
+interface Mention {
+  label: string;
+  projectId: string;
+}
+/** Resolved threads by id; null for one that no longer resolves. */
+const mentionCache = new Map<string, Mention | null>();
+const ThreadMentions =
+  createContext<ReadonlyMap<string, Mention | null>>(mentionCache);
+
+/** The threads the messages mention, resolved once each per page load. */
+function useThreadMentions(messages: ChatMessage[]) {
+  const sdk = useSdk();
+  const [resolved, setResolved] = useState(() => new Map(mentionCache));
+  useEffect(() => {
+    const ids = new Set<string>();
+    for (const { text } of messages) {
+      for (const [, , id] of text.matchAll(THREAD_MENTION)) {
+        if (!mentionCache.has(id!)) ids.add(id!);
+      }
+    }
+    if (ids.size === 0) return;
+    let stale = false;
+    sdk.threads.resolveMentions({ threadIds: [...ids] }).then(
+      (found) => {
+        for (const id of ids) mentionCache.set(id, null);
+        for (const { threadId, label, projectId } of found) {
+          mentionCache.set(threadId, { label, projectId });
+        }
+        if (!stale) setResolved(new Map(mentionCache));
+      },
+      () => {},
+    );
+    return () => {
+      stale = true;
+    };
+  }, [sdk, messages]);
+  return resolved;
+}
+
+/** bb's Markdown, with thread mentions written as links to their threads. */
+function ChatMarkdown({ content }: { content: string }) {
+  const mentions = useContext(ThreadMentions);
+  const linked = content
+    .split(CODE)
+    .map((part, index) =>
+      // Odd parts are code.
+      index % 2 === 1
+        ? part
+        : part.replace(THREAD_MENTION, (whole, before: string, id: string) => {
+            const mention = mentions.get(id);
+            if (mention == null) return whole;
+            const label = mention.label.replace(/[[\]\\]/gu, "\\$&");
+            const url = `${window.location.origin}/projects/${mention.projectId}/threads/${id}`;
+            return `${before}[${label}](${url})`;
+          }),
+    )
+    .join("");
+  return <Markdown content={linked} />;
+}
+
 function Transcript({
   messages,
   more,
@@ -756,41 +828,48 @@ function Transcript({
   onLoadEarlier: () => void;
   acolytes: Map<string, Sage>;
 }) {
+  const mentions = useThreadMentions(messages);
   if (messages.length === 0) return null;
   return (
-    // Wide tables and code scroll sideways in place, as in bb's chats,
-    // rather than running off a phone's screen.
-    <div className="flex min-w-0 flex-col gap-4 py-4 break-words [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
-      {more ? (
-        <Button variant="ghost" className="self-center" onClick={onLoadEarlier}>
-          Load earlier messages
-        </Button>
-      ) : null}
-      {messages.map((message) =>
-        message.kind === "work" ? (
-          <WorkLine key={message.i} text={message.text} />
-        ) : message.kind === "acolyte" ? (
-          ACOLYTE_OPENING.test(message.text) ? (
-            <AcolyteOpening key={message.i} text={message.text} />
-          ) : (
-            <AcolyteMarker
-              key={message.i}
-              text={message.text}
-              acolytes={acolytes}
-            />
-          )
-        ) : message.kind === "user" ? (
-          <div
-            key={message.i}
-            className="max-w-[85%] self-end whitespace-pre-wrap rounded-2xl bg-muted px-4 py-2 text-sm break-words"
+    <ThreadMentions.Provider value={mentions}>
+      {/* Wide tables and code scroll sideways in place, as in bb's chats,
+        rather than running off a phone's screen. */}
+      <div className="flex min-w-0 flex-col gap-4 py-4 break-words [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto [&_a[href*='/threads/']]:inline-block [&_a[href*='/threads/']]:max-w-full [&_a[href*='/threads/']]:truncate [&_a[href*='/threads/']]:align-bottom [&_a[href*='/threads/']]:rounded-md [&_a[href*='/threads/']]:bg-muted [&_a[href*='/threads/']]:px-1.5 [&_a[href*='/threads/']]:py-0.5 [&_a[href*='/threads/']]:text-[0.9em] [&_a[href*='/threads/']]:font-medium [&_a[href*='/threads/']]:text-foreground [&_a[href*='/threads/']]:no-underline [&_a[href*='/threads/']]:hover:bg-accent">
+        {more ? (
+          <Button
+            variant="ghost"
+            className="self-center"
+            onClick={onLoadEarlier}
           >
-            {message.text}
-          </div>
-        ) : (
-          <Markdown key={message.i} content={message.text} />
-        ),
-      )}
-    </div>
+            Load earlier messages
+          </Button>
+        ) : null}
+        {messages.map((message) =>
+          message.kind === "work" ? (
+            <WorkLine key={message.i} text={message.text} />
+          ) : message.kind === "acolyte" ? (
+            ACOLYTE_OPENING.test(message.text) ? (
+              <AcolyteOpening key={message.i} text={message.text} />
+            ) : (
+              <AcolyteMarker
+                key={message.i}
+                text={message.text}
+                acolytes={acolytes}
+              />
+            )
+          ) : message.kind === "user" ? (
+            <div
+              key={message.i}
+              className="max-w-[85%] self-end whitespace-pre-wrap rounded-2xl bg-muted px-4 py-2 text-sm break-words"
+            >
+              {message.text}
+            </div>
+          ) : (
+            <ChatMarkdown key={message.i} content={message.text} />
+          ),
+        )}
+      </div>
+    </ThreadMentions.Provider>
   );
 }
 
@@ -814,11 +893,14 @@ function TurnView({
   turn,
   visible,
   leading,
+  trailing,
   onReady,
 }: {
   turn: Turn;
   visible: boolean;
   leading: ReactNode;
+  /** Shown after the turn once it is visible: messages still being sent. */
+  trailing: ReactNode;
   onReady: () => void;
 }) {
   const area = useRef<HTMLDivElement>(null);
@@ -876,6 +958,7 @@ function TurnView({
           layout="document"
           leadingContent={<div {...{ [LEADING]: "" }}>{leading}</div>}
         />
+        {visible ? <div className="px-2 pb-3">{trailing}</div> : null}
       </div>
     </ScrollToEnd>
   );
@@ -934,6 +1017,84 @@ function ScrollToEnd({
   );
 }
 
+/** A message the user sent that the chat has not logged yet. */
+interface Outgoing {
+  requestId: string;
+  request: Record<string, unknown> & {
+    projectId: string;
+    input: ({ type: string } & Record<string, unknown>)[];
+  };
+  /** What the user sees of it. */
+  text: string;
+  /** The chat's size when it was sent. */
+  after: number;
+  /** Why it could not be sent, once it could not. */
+  error: string | null;
+}
+
+const errorText = (cause: unknown) =>
+  cause instanceof Error ? cause.message : String(cause);
+
+/** The words of a prompt input the user sees, and a mark per attachment. */
+function visibleText(input: readonly unknown[]): string {
+  return input
+    .map((part) => {
+      const each = part as Record<string, unknown>;
+      if (each.visibility === "agent-only") return "";
+      if (each.type === "text") return String(each.text ?? "");
+      return `[${String(each.type)}]`;
+    })
+    .filter((text) => text !== "")
+    .join("\n");
+}
+
+/** Messages on their way: sending, or unsent with a way to try again. */
+function Outbox({
+  items,
+  onRetry,
+  onDismiss,
+}: {
+  items: Outgoing[];
+  onRetry: (item: Outgoing) => void;
+  onDismiss: (item: Outgoing) => void;
+}) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2 pt-4">
+      {items.map((item) => (
+        <div key={item.requestId} className="flex flex-col items-end gap-1">
+          <div
+            className={`max-w-[85%] whitespace-pre-wrap break-words rounded-2xl bg-muted px-4 py-2 text-sm ${item.error === null ? "opacity-60" : ""}`}
+          >
+            {item.text}
+          </div>
+          {item.error === null ? (
+            <span className="text-xs text-muted-foreground">Sending…</span>
+          ) : (
+            <span className="flex items-center gap-2 text-xs text-destructive">
+              Not sent: {item.error}
+              <Button
+                variant="ghost"
+                className="h-6 px-2 text-xs"
+                onClick={() => onRetry(item)}
+              >
+                Retry
+              </Button>
+              <Button
+                variant="ghost"
+                className="h-6 px-2 text-xs text-muted-foreground"
+                onClick={() => onDismiss(item)}
+              >
+                Dismiss
+              </Button>
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SageChat({ sageId }: { sageId: string }) {
   const { rpc, sages, error, report } = useSages();
   const navigate = useBbNavigate();
@@ -954,6 +1115,17 @@ function SageChat({ sageId }: { sageId: string }) {
   // The turn on screen, kept after it ends: swapping back to the logged chat
   // would reflow the page for nothing. A new turn replaces it once loaded.
   const [shown, setShown] = useState<Turn | null>(null);
+  const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
+  // A message leaves the outbox once the chat has logged it: one logged
+  // user message from when it was sent on clears the oldest one waiting.
+  useEffect(() => {
+    if (outgoing.length === 0) return;
+    const from = Math.min(...outgoing.map((item) => item.after));
+    const logged = history.messages.filter(
+      (message) => message.kind === "user" && message.i >= from,
+    ).length;
+    if (logged > 0) setOutgoing((current) => current.slice(logged));
+  }, [history.messages]); // eslint-disable-line react-hooks/exhaustive-deps
   const pending: Turn | null =
     sage?.running === true &&
     sage.threadId !== null &&
@@ -981,13 +1153,62 @@ function SageChat({ sageId }: { sageId: string }) {
     );
   }
 
-  const sendMessage = async (request: NewThreadRequest) => {
-    // The request crosses RPC as plain JSON; bb validates it at spawn.
-    await rpc.call("sages_send", {
-      id: sage.id,
-      request: JSON.parse(JSON.stringify(request)),
-    });
+  const post = (item: Outgoing) => {
+    rpc
+      .call("sages_send", {
+        id: sage.id,
+        request: item.request,
+        requestId: item.requestId,
+      })
+      .catch((cause: unknown) => {
+        // The server may have it all the same: a retry carries the same
+        // id, so it is never sent twice.
+        setOutgoing((current) =>
+          current.map((each) =>
+            each.requestId === item.requestId
+              ? { ...each, error: errorText(cause) }
+              : each,
+          ),
+        );
+      });
   };
+  // Never throws: the message stays on the page as sending or unsent, and
+  // the composer clears, so a slow send is never mistaken for a lost one.
+  const sendMessage = async (request: NewThreadRequest) => {
+    const item: Outgoing = {
+      requestId: crypto.randomUUID(),
+      // The request crosses RPC as plain JSON; bb validates it at spawn.
+      request: JSON.parse(JSON.stringify(request)),
+      text: visibleText(request.input),
+      after: sage.stats.messages,
+      error: null,
+    };
+    setOutgoing((current) => [...current, item]);
+    post(item);
+  };
+  const retry = (item: Outgoing) => {
+    setOutgoing((current) =>
+      current.map((each) =>
+        each.requestId === item.requestId ? { ...each, error: null } : each,
+      ),
+    );
+    post(item);
+  };
+  const outbox = (
+    <Outbox
+      items={outgoing.map((item) =>
+        item.error === null && sage.unsent?.requestId === item.requestId
+          ? { ...item, error: sage.unsent.error }
+          : item,
+      )}
+      onRetry={retry}
+      onDismiss={(item) =>
+        setOutgoing((current) =>
+          current.filter((each) => each.requestId !== item.requestId),
+        )
+      }
+    />
+  );
   const isAcolyte = sage.parentId !== null;
   const acolytes = new Map(
     sages
@@ -1152,7 +1373,10 @@ function SageChat({ sageId }: { sageId: string }) {
               <div className={CHAT_COLUMN}>
                 {/* ThreadChat's own padding, so nothing shifts when it
                     takes over. */}
-                <div className="px-2 pb-3 pt-3">{transcript(null)}</div>
+                <div className="px-2 pb-3 pt-3">
+                  {transcript(null)}
+                  {outbox}
+                </div>
               </div>
             </ScrollToEnd>
           ) : null}
@@ -1164,6 +1388,7 @@ function SageChat({ sageId }: { sageId: string }) {
                 turn={turn}
                 visible={turn === shown}
                 leading={transcript(turn)}
+                trailing={outbox}
                 onReady={() => setShown(turn)}
               />
             ),
