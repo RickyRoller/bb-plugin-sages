@@ -764,7 +764,25 @@ export default async function plugin(bb: BbPluginApi) {
                   `- "${acolyte.name}" (acolyte ${acolyte.id}, since ${acolyte.createdAt}${acolyte.running ? ", working" : ""}): ${acolyte.topic || "no focus given"}`,
               ),
             ].join("\n");
-      return [view, [date, acolytes, specialists].join("\n\n")];
+      const waiting = [...rounds.values()].filter(
+        (round) => round.sageId === sage.id,
+      );
+      const openRounds =
+        waiting.length === 0
+          ? null
+          : [
+              "Open acolyte rounds:",
+              ...waiting.map(
+                (round) =>
+                  `- "${round.name}" (since ${new Date(round.startedAt).toISOString()}): waiting on ${nameList(round.pending)}; replied: ${nameList(round.replied)}`,
+              ),
+            ].join("\n");
+      return [
+        view,
+        [date, acolytes, openRounds, specialists]
+          .filter((part) => part !== null)
+          .join("\n\n"),
+      ];
     }
     const parent = findSage(sage.parentId);
     const acolyte = [
@@ -1028,6 +1046,8 @@ export default async function plugin(bb: BbPluginApi) {
   interface Worker {
     sageId: string;
     specialist: string;
+    /** For an acolyte asked as part of a round: the round's key and the acolyte. */
+    round?: { key: string; acolyte: string };
   }
   const workers = new Map(
     Object.entries(
@@ -1036,6 +1056,102 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const saveWorkers = () =>
     bb.storage.kv.set("workers", Object.fromEntries(workers));
+
+  /**
+   * Acolyte messages a sage sent as one round, until every acolyte in it has
+   * replied. Nothing is held back: each reply still arrives at once, saying
+   * who the round is still waiting on, so the sage knows where it stands.
+   */
+  interface Round {
+    sageId: string;
+    name: string;
+    startedAt: number;
+    pending: string[];
+    replied: string[];
+  }
+  const ROUND_TIMEOUT_MS = 30 * 60_000;
+  const rounds = new Map(
+    Object.entries(
+      (await bb.storage.kv.get<Record<string, Round>>("rounds")) ?? {},
+    ),
+  );
+  const saveRounds = () =>
+    bb.storage.kv.set("rounds", Object.fromEntries(rounds));
+  const roundTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const roundKey = (sageId: string, name: string) => `${sageId}:${name}`;
+  const nameList = (names: string[]) => names.join(", ") || "none";
+
+  function scheduleRound(key: string) {
+    const round = rounds.get(key);
+    if (round === undefined || roundTimers.has(key)) return;
+    const left = round.startedAt + ROUND_TIMEOUT_MS - Date.now();
+    roundTimers.set(
+      key,
+      setTimeout(() => expireRound(key), Math.max(0, left)),
+    );
+  }
+  /** Adds an acolyte to a round, opening the round if it is new. */
+  async function joinRound(sageId: string, name: string, acolyte: string) {
+    const key = roundKey(sageId, name);
+    const round = rounds.get(key) ?? {
+      sageId,
+      name,
+      startedAt: Date.now(),
+      pending: [],
+      replied: [],
+    };
+    // A follow-up to an acolyte that already replied waits for it again.
+    round.replied = round.replied.filter((each) => each !== acolyte);
+    if (!round.pending.includes(acolyte)) round.pending.push(acolyte);
+    rounds.set(key, round);
+    await saveRounds();
+    scheduleRound(key);
+    return { key, round };
+  }
+  function roundStatus(round: Round): string {
+    return round.pending.length === 0
+      ? `Round "${round.name}" complete: all ${round.replied.length} replied (${nameList(round.replied)}). Reconcile the replies together now.`
+      : `Round "${round.name}": ${round.replied.length} of ${round.replied.length + round.pending.length} replied; still waiting on ${nameList(round.pending)}.`;
+  }
+  /** Marks an acolyte's reply in its round, and says where the round stands. */
+  function roundReply(key: string, acolyte: string): string | null {
+    const round = rounds.get(key);
+    if (round === undefined || !round.pending.includes(acolyte)) return null;
+    round.pending = round.pending.filter((each) => each !== acolyte);
+    round.replied.push(acolyte);
+    if (round.pending.length === 0) {
+      rounds.delete(key);
+      clearTimeout(roundTimers.get(key));
+      roundTimers.delete(key);
+    }
+    saveRounds().catch(() => {});
+    return roundStatus(round);
+  }
+  /** Closes a round that waited too long, naming who never replied. */
+  function expireRound(key: string) {
+    roundTimers.delete(key);
+    const round = rounds.get(key);
+    if (round === undefined) return;
+    rounds.delete(key);
+    saveRounds().catch(() => {});
+    const note = `[round "${round.name}"] closed after ${ROUND_TIMEOUT_MS / 60_000} minutes; no reply yet from ${nameList(round.pending)}. Replied: ${nameList(round.replied)}. Go on with what you have; a late reply still arrives as usual.`;
+    serial(round.sageId, async () => {
+      try {
+        await deliver(
+          round.sageId,
+          null,
+          `Round "${round.name}" timed out`,
+          note,
+        );
+      } catch (cause) {
+        chatOf(round.sageId).append("work", note);
+        throw cause;
+      }
+    }).catch((cause) =>
+      bb.log.warn(`could not deliver a round timeout: ${errorText(cause)}`),
+    );
+  }
+  for (const key of rounds.keys()) scheduleRound(key);
   /**
    * Reports sent into a running turn by their one-line notice, so its log
    * records the whole report as work.
@@ -1099,7 +1215,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (sage === undefined) return;
     const sageId = sage.id;
     serial(sageId, async () => {
-      const text = await report(worker.specialist);
+      const status =
+        worker.round === undefined
+          ? null
+          : roundReply(worker.round.key, worker.round.acolyte);
+      const text =
+        (await report(worker.specialist)) +
+        (status === null ? "" : `\n\n${status}`);
       try {
         await deliver(
           sageId,
@@ -1446,7 +1568,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: MESSAGE_TOOL,
     description:
-      'Send a message to one of your open acolytes. It works on it in its own chat, and its reply reaches this chat as a message starting "[acolyte". Never wait for it.',
+      'Send a message to one of your open acolytes. It works on it in its own chat, and its reply reaches this chat as a message starting "[acolyte". Never wait for it. Give messages whose replies you will weigh together the same round.',
     presentation: {
       label: { pending: "Messaging acolyte", completed: "Messaged acolyte" },
     },
@@ -1464,8 +1586,17 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "What to do or answer, and what to send back. It has your memory, so refer to the chat freely.",
         ),
+      round: z
+        .string()
+        .trim()
+        .min(1)
+        .max(80)
+        .optional()
+        .describe(
+          "A short name for a round of independent questions to several acolytes; each reply then says who the round is still waiting on",
+        ),
     }),
-    execute: ({ acolyte: which, message }, { threadId }) =>
+    execute: ({ acolyte: which, message, round }, { threadId }) =>
       toolResult(async () => {
         const sage = await sageOfTurn(threadId);
         const key = which.toLowerCase();
@@ -1509,14 +1640,27 @@ export default async function plugin(bb: BbPluginApi) {
         // Its reply comes back like a specialist's report, when the turn
         // the message started or joined goes idle.
         const turn = findSage(acolyte.id).threadId;
+        let joined: Awaited<ReturnType<typeof joinRound>> | null = null;
         if (turn !== null) {
+          if (round !== undefined)
+            joined = await joinRound(sage.id, round, acolyte.name);
           workers.set(turn, {
             sageId: sage.id,
             specialist: `acolyte ${acolyte.name}`,
+            ...(joined === null
+              ? {}
+              : { round: { key: joined.key, acolyte: acolyte.name } }),
           });
           await saveWorkers();
         }
-        return `Sent to "${acolyte.name}" (acolyte ${acolyte.id}). Its reply reaches this chat as a message starting "[acolyte ${acolyte.name}]". Do not wait for it or do its work meanwhile.`;
+        return [
+          `Sent to "${acolyte.name}" (acolyte ${acolyte.id}). Its reply reaches this chat as a message starting "[acolyte ${acolyte.name}]". Do not wait for it or do its work meanwhile.`,
+          ...(joined === null
+            ? []
+            : [
+                `Round "${round}" is waiting on ${nameList(joined.round.pending)}.`,
+              ]),
+        ].join("\n");
       }),
   });
   bb.agents.registerTool({

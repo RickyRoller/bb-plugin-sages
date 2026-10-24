@@ -93,7 +93,17 @@ acolytes are listed after the view.
 To ask an open acolyte something or give it work in its focus, use
 sage_message_acolyte(acolyte, message), whenever the user or your instructions
 call for it. Its reply reaches this chat as a message starting "[acolyte
-<name>]", between your tool calls or as a new turn: never wait for it.`;
+<name>]", between your tool calls or as a new turn: never wait for it.
+
+When you ask several acolytes things whose answers you will weigh together,
+give each of those messages the same round, a short name; a follow-up to one of
+them in the same round joins it. Each reply then ends by saying who the round
+is still waiting on, the last says it is complete, and open rounds are listed
+after the view. While a round is open, take each reply in briefly and keep its
+findings and questions for the end; meanwhile answer the user as usual. When it
+completes, reconcile all the replies at once and bring the user one summary and
+one set of asks. A round still open after 30 minutes closes with a note naming
+who never replied.`;
 
 export const ACOLYTE_SUMMARY_PROMPT = `You write the closing summary of an acolyte: a sage
 focused on one part of a lead sage's work, in a chat of its own. (A sage is an
