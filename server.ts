@@ -7,6 +7,8 @@
 // file owns the sage records, the turns, the logging of what a turn's thread
 // does, the zoom/date tools, the compaction model call, and the CLI.
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
@@ -1767,10 +1769,15 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb sages list [--json]",
     "  bb sages show <sage-id> [--json]",
     "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
+    "  bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--project <project-id|none>] [--json]",
+    "  bb sages send <sage-id> (<message> | --message-file <path>) [--json]",
     "  bb sages lead <sage-id> <lead-sage-id|none> [--json]",
     "  bb sages remove <sage-id> [--json]",
     ...ENVOY_USAGE.split("\n").slice(1),
   ].join("\n");
+  async function readText(path: string, cwd: string | undefined) {
+    return readFile(resolve(cwd ?? process.cwd(), path), "utf8");
+  }
   function formatSage(sage: Sage): string {
     const topic = sage.topic === "" ? "" : `  — ${sage.topic}`;
     return `${sage.id}  ${sage.name}${topic}`;
@@ -1791,6 +1798,19 @@ export default async function plugin(bb: BbPluginApi) {
         summary: "Create a sage",
         usage:
           "bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
+      },
+      {
+        name: "edit",
+        summary: "Change a sage's name, topic, instructions or project",
+        usage:
+          "bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--project <project-id|none>] [--json]",
+      },
+      {
+        name: "send",
+        summary:
+          "Send a sage a message: a fresh turn, or into the running one. From an agent's thread, it says which thread sent it",
+        usage:
+          "bb sages send <sage-id> (<message> | --message-file <path>) [--json]",
       },
       {
         name: "lead",
@@ -1816,7 +1836,10 @@ export default async function plugin(bb: BbPluginApi) {
           arg === "--topic" ||
           arg === "--instructions" ||
           arg === "--project" ||
-          arg === "--lead"
+          arg === "--lead" ||
+          arg === "--name" ||
+          arg === "--instructions-file" ||
+          arg === "--message-file"
         ) {
           const value = argv[(index += 1)];
           if (value === undefined) return { exitCode: 1, stderr: usage };
@@ -1897,6 +1920,88 @@ export default async function plugin(bb: BbPluginApi) {
             }
             const sage = await createUnder(input.data);
             return reply(sage, `Created ${formatSage(sage)}`);
+          }
+          case "edit": {
+            if (sageId === undefined || rest.length !== 1) break;
+            if (
+              flags.instructions !== undefined &&
+              flags["instructions-file"] !== undefined
+            ) {
+              break;
+            }
+            const instructions =
+              flags["instructions-file"] === undefined
+                ? flags.instructions
+                : await readText(flags["instructions-file"], ctx.cwd);
+            const project = flags.project;
+            const input = rpcContract.sages_update.input.safeParse({
+              id: sageId,
+              name: flags.name,
+              topic: flags.topic,
+              instructions,
+              projectId: project === "none" ? null : project,
+            });
+            if (!input.success) {
+              return {
+                exitCode: 1,
+                stderr: `${z.prettifyError(input.error)}\n${usage}`,
+              };
+            }
+            const { id, ...patch } = input.data;
+            if (Object.values(patch).every((value) => value === undefined)) {
+              break;
+            }
+            findSage(id);
+            if (typeof patch.projectId === "string") {
+              const projects = await bb.sdk.projects.list();
+              if (!projects.some((each) => each.id === patch.projectId)) {
+                return {
+                  exitCode: 1,
+                  stderr: `No project with id ${patch.projectId}. Run "bb project list" to see ids.`,
+                };
+              }
+            }
+            const sage = await updateSage(id, patch);
+            return reply(sage, `Updated ${formatSage(sage)}`);
+          }
+          case "send": {
+            if (sageId === undefined) break;
+            const file = flags["message-file"];
+            if ((file === undefined) === (rest.length < 2)) break;
+            const message = (
+              file === undefined
+                ? rest.slice(1).join(" ")
+                : await readText(file, ctx.cwd)
+            ).trim();
+            if (message === "") {
+              return { exitCode: 1, stderr: "The message is empty." };
+            }
+            const sage = findSage(sageId);
+            if (sage.defaults === null) {
+              return {
+                exitCode: 1,
+                stderr: `${sage.name} has had no turn yet; send its first message in bb so it knows where to run.`,
+              };
+            }
+            // An agent's message says where it came from, so the sage can
+            // answer it with bb thread tell instead of mistaking it for the user's.
+            const text =
+              ctx.threadId === undefined
+                ? message
+                : `[bb message from thread:${ctx.threadId}] ${message}`;
+            await serial(sageId, () =>
+              send(
+                sageId,
+                turnRequestSchema.parse({
+                  ...sage.defaults,
+                  input: [{ type: "text", text, mentions: [] }],
+                }),
+              ),
+            );
+            return reply(
+              { sent: true, id: sageId },
+              `Sent to ${sage.name}. Its reply stays in its own chat.`,
+            );
           }
           case "lead": {
             const [, lead] = rest;
