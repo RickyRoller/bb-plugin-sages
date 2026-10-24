@@ -21,8 +21,10 @@ const PARALLEL = 8;
 /** A message's node waits until fewer than this many before it are unbuilt. */
 const WINDOW = 8;
 const TRIES = 5;
-/** How long a failed call waits before it is tried again. */
-const RETRY_MS = 60_000;
+/** How long a failed call waits before it is tried again; doubles per failure in a row. */
+const RETRY_MS = 30_000;
+/** The longest wait between tries while calls keep failing. */
+const RETRY_MAX_MS = 30 * 60_000;
 const UNBUILT = "(not summarized yet: zoom it)";
 
 export type Kind = "user" | "sage" | "tool" | "echo" | "work" | "acolyte";
@@ -140,6 +142,8 @@ export interface ChatStats {
   viewBytes: number;
   /** Nodes whose inputs exist but which are not built yet. */
   pending: number;
+  /** Set while compaction calls keep failing: the last error and the next try. */
+  failing: { error: string; failures: number; retryAt: string } | null;
 }
 
 export class Chat {
@@ -153,6 +157,13 @@ export class Chat {
   private failedMerges: Ref[] = [];
   /** Tries failed calls again after a pause, so a quiet chat still heals. */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the paused calls are tried again, while backing off. */
+  private retryAt: number | null = null;
+  /** Calls failed in a row; a success resets it. */
+  private failures = 0;
+  /** Pauses in a row; each one is twice as long as the last. */
+  private pauses = 0;
+  private lastError = "";
   private inflight = new Set<number>();
   private running = 0;
   private sizes = new Map<number, number>();
@@ -260,8 +271,9 @@ export class Chat {
       this.sql.saveView.run(this.sage, JSON.stringify(this.state));
     })();
     if (ids.length > 0) {
-      // A failed call is tried again at the next message.
-      this.retryFailed();
+      // A failed call is tried again at the next message, unless calls keep
+      // failing: then only the backoff timer tries again.
+      if (this.retryAt === null) this.retryFailed();
       this.onChange();
     }
     return ids;
@@ -271,6 +283,7 @@ export class Chat {
   private retryFailed(): void {
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    this.retryAt = null;
     this.failedMessages.clear();
     this.merges.push(...this.failedMerges.splice(0));
     this.pump();
@@ -328,6 +341,14 @@ export class Chat {
       viewBytes: this.size(this.state.view),
       pending:
         this.unbuilt.length + this.merges.length + this.failedMerges.length,
+      failing:
+        this.failures === 0
+          ? null
+          : {
+              error: this.lastError,
+              failures: this.failures,
+              retryAt: new Date(this.retryAt ?? Date.now()).toISOString(),
+            },
     };
   }
 
@@ -431,12 +452,20 @@ export class Chat {
   private isSettled(): boolean {
     return (
       this.abort.signal.aborted ||
+      // A failing compactor holds no message up.
+      this.failures > 0 ||
       this.unbuilt.every((i) => this.failedMessages.has(i))
     );
   }
 
   private pump(): void {
-    while (this.running < PARALLEL && !this.abort.signal.aborted) {
+    // While calls fail, one at a time probes the model, and none during a pause.
+    const limit = this.failures > 0 ? 1 : PARALLEL;
+    while (
+      this.running < limit &&
+      this.retryAt === null &&
+      !this.abort.signal.aborted
+    ) {
       const message = this.unbuilt
         .slice(0, WINDOW)
         .find((i) => !this.inflight.has(i) && !this.failedMessages.has(i));
@@ -450,6 +479,8 @@ export class Chat {
           (text) => {
             if (this.abort.signal.aborted) return;
             this.inflight.delete(ref[1]);
+            this.failures = 0;
+            this.pauses = 0;
             this.db.transaction(() => this.built(ref, text))();
             this.onChange();
           },
@@ -459,10 +490,20 @@ export class Chat {
               this.inflight.delete(ref[1]);
               this.failedMessages.add(ref[1]);
             } else this.failedMerges.push(ref);
-            this.retryTimer ??= setTimeout(() => {
-              this.retryTimer = null;
-              this.retryFailed();
-            }, RETRY_MS);
+            this.failures += 1;
+            this.lastError = error instanceof Error ? error.message : String(error);
+            if (this.retryTimer === null) {
+              const wait = Math.min(
+                RETRY_MS * 2 ** Math.min(this.pauses, 20),
+                RETRY_MAX_MS,
+              );
+              this.pauses += 1;
+              this.retryAt = Date.now() + wait;
+              this.retryTimer = setTimeout(() => {
+                this.retryTimer = null;
+                this.retryFailed();
+              }, wait);
+            }
             this.onChange(error);
           },
         )

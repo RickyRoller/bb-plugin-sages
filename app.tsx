@@ -208,6 +208,34 @@ function ErrorLine({ error }: { error: string | null }) {
   );
 }
 
+/** When a time is: "in 4 min", or "now" once it has passed. */
+function fromNow(iso: string): string {
+  const minutes = Math.round((Date.parse(iso) - Date.now()) / 60_000);
+  return minutes <= 0 ? "now" : `in ${minutes} min`;
+}
+
+/** A warning while a chat's summaries keep failing: its memory is not kept up. */
+function SummaryAlert({ sages }: { sages: Sage[] }) {
+  const failing = sages.filter((sage) => sage.stats.failing !== null);
+  if (failing.length === 0) return null;
+  const first = failing[0]!.stats.failing!;
+  return (
+    <div
+      role="alert"
+      className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+    >
+      <div className="font-medium">
+        Memory summaries are failing for{" "}
+        {failing.map((sage) => sage.name).join(", ")}
+      </div>
+      <div className="mt-0.5 break-words text-xs opacity-90">
+        {first.error} · {first.failures} failed in a row · next try{" "}
+        {fromNow(first.retryAt)}. Check the summary model in Sages settings.
+      </div>
+    </div>
+  );
+}
+
 function SageList() {
   const { rpc, sages, error, report } = useSages();
   const projects = useProjects();
@@ -243,6 +271,7 @@ function SageList() {
           }}
         />
         <ErrorLine error={error} />
+        {sages === null ? null : <SummaryAlert sages={sages} />}
         {sages === null ? (
           <Notice>Loading sages…</Notice>
         ) : sages.every((sage) => sage.parentId !== null) ? (
@@ -1251,6 +1280,19 @@ function SageChat({ sageId }: { sageId: string }) {
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{sage.name}</div>
         </div>
+        {sage.stats.failing === null ? null : (
+          <span
+            role="status"
+            title={`${sage.stats.failing.error} · ${sage.stats.failing.failures} failed in a row · next try ${fromNow(sage.stats.failing.retryAt)}`}
+            className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs text-destructive"
+          >
+            <span
+              aria-hidden="true"
+              className="size-1.5 rounded-full bg-destructive"
+            />
+            Memory failing
+          </span>
+        )}
         {sage.running ? (
           // In the header, so the chat never shifts as turns start and end.
           <Button
@@ -1309,6 +1351,11 @@ function SageChat({ sageId }: { sageId: string }) {
           <Icon name="Trash2" className="size-4" />
         </Button>
       </header>
+      {sage.stats.failing === null ? null : (
+        <div className="px-4 pt-2">
+          <SummaryAlert sages={[sage]} />
+        </div>
+      )}
       {branching && !isAcolyte ? (
         <NewAcolyteForm
           sage={sage}

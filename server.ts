@@ -14,7 +14,7 @@ import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
 import { ENVOY_USAGE, registerEnvoys, type EnvoyConfig } from "./envoys.ts";
 import type { Envoy } from "./envoy-contract.ts";
-import { MissingCli, runDirect } from "./harness.ts";
+import { MissingCli, runDirect, type ModelChoice } from "./harness.ts";
 import {
   COMPACTION_PROMPT,
   HANDOFF_PROMPT,
@@ -68,6 +68,9 @@ const statsSchema = z.object({
   messages: z.number(),
   viewBytes: z.number(),
   pending: z.number(),
+  failing: z
+    .object({ error: z.string(), failures: z.number(), retryAt: z.string() })
+    .nullable(),
 });
 const listedSageSchema = sageSchema.extend({ stats: statsSchema });
 export type ListedSage = z.infer<typeof listedSageSchema>;
@@ -90,7 +93,7 @@ const turnRequestSchema = z.looseObject({
 
 /**
  * The model that writes summaries, as bb's provider/model picker chose it;
- * null runs them on bb's defaults.
+ * null runs them on the model of the sage's own turns.
  */
 const summaryModelSchema = z
   .object({
@@ -496,17 +499,40 @@ export default async function plugin(bb: BbPluginApi) {
     prompt: string,
     signal: AbortSignal,
   ): Promise<string> {
-    const choice = preferences.summaryModel;
-    if (choice !== null) {
-      try {
-        const answer = await runDirect(choice, system, prompt, signal);
-        if (answer !== null) return answer;
-      } catch (error) {
-        if (!(error instanceof MissingCli)) throw error;
-        bb.log.warn(`${errorText(error)}; summarizing in a bb thread instead`);
-      }
+    const choice = preferences.summaryModel ?? turnModel(sageId);
+    try {
+      const answer = await runDirect(choice, system, prompt, signal);
+      if (answer !== null) return answer;
+    } catch (error) {
+      if (!(error instanceof MissingCli)) throw error;
+      bb.log.warn(`${errorText(error)}; summarizing in a bb thread instead`);
     }
-    return runInThread(sageId, system, prompt, signal);
+    return runInThread(sageId, choice, system, prompt, signal);
+  }
+
+  /**
+   * The model the sage's turns run on, its lead's for an acolyte that has
+   * none: known to work, unlike bb's defaults, which may name no model.
+   */
+  function turnModel(sageId: string): ModelChoice & { serviceTier?: string } {
+    const sage = findSage(sageId);
+    const defaults =
+      sage.defaults ??
+      (sage.parentId === null ? null : findSage(sage.parentId).defaults);
+    const { providerId, model, reasoningLevel, serviceTier } = (defaults ??
+      {}) as Record<string, unknown>;
+    if (typeof providerId !== "string" || typeof model !== "string") {
+      throw new Error(
+        `${sage.name} has no turn yet: choose a summary model in Sages settings`,
+      );
+    }
+    return {
+      providerId,
+      model,
+      reasoningLevel:
+        typeof reasoningLevel === "string" ? reasoningLevel : "medium",
+      ...(typeof serviceTier === "string" ? { serviceTier } : {}),
+    };
   }
 
   /**
@@ -515,6 +541,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function runInThread(
     sageId: string,
+    choice: ModelChoice & { serviceTier?: string },
     system: string,
     prompt: string,
     signal: AbortSignal,
@@ -531,7 +558,8 @@ export default async function plugin(bb: BbPluginApi) {
     const thread = await bb.sdk.threads.spawn({
       projectId: turn.projectId,
       environment: { type: "reuse", environmentId: turn.environmentId },
-      ...(preferences.summaryModel ?? {}),
+      // Always a named model: bb's defaults may have none.
+      ...choice,
       permissionMode: "accept-edits",
       visibility: "hidden",
       title: `${sage.name} memory`,
@@ -541,6 +569,7 @@ export default async function plugin(bb: BbPluginApi) {
         { type: "text", text: prompt, mentions: [] },
       ],
     } as unknown as Parameters<typeof bb.sdk.threads.spawn>[0]);
+    liveSummaryThreads.add(thread.id);
     try {
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -552,11 +581,55 @@ export default async function plugin(bb: BbPluginApi) {
       const { output } = await bb.sdk.threads.output({ threadId: thread.id });
       return output ?? "";
     } finally {
-      bb.sdk.threads
-        .delete({ threadId: thread.id, childThreadsConfirmed: true })
-        .catch(() => {});
+      liveSummaryThreads.delete(thread.id);
+      deleteSummaryThread(thread.id);
     }
   }
+  /** This run's summary threads still at work, which a sweep leaves alone. */
+  const liveSummaryThreads = new Set<string>();
+  function deleteSummaryThread(threadId: string): void {
+    bb.sdk.threads
+      .delete({ threadId, childThreadsConfirmed: true })
+      .catch((error) =>
+        bb.log.warn(`could not delete summary thread ${threadId}: ${errorText(error)}`),
+      );
+  }
+  /**
+   * Summary threads left by an earlier run, cut off by a reload or a failed
+   * delete: any not at work in this run.
+   */
+  async function sweepSummaryThreads(): Promise<void> {
+    const found: string[] = [];
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += 100) {
+        const threads = await bb.sdk.threads.list({
+          originPluginId: "sages",
+          includeHidden: true,
+          archived,
+          limit: 100,
+          offset,
+        });
+        if (!threads.length) break;
+        const batch = await bb.sdk.threads.experimental_listPluginMetadata({
+          threadIds: threads.map((t) => t.id),
+        });
+        for (const { threadId, metadata } of batch.threads) {
+          if (
+            metadata[SUMMARY_THREAD] === true &&
+            !liveSummaryThreads.has(threadId)
+          )
+            found.push(threadId);
+        }
+        if (threads.length < 100) break;
+      }
+    }
+    found.forEach(deleteSummaryThread);
+    if (found.length > 0)
+      bb.log.info(`deleting ${found.length} left-over summary threads`);
+  }
+  sweepSummaryThreads().catch((error) =>
+    bb.log.warn(`could not sweep summary threads: ${errorText(error)}`),
+  );
   const summarize =
     (sageId: string): Summarize =>
     (conversation, signal) =>

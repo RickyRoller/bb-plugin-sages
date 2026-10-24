@@ -111,3 +111,40 @@ test("the view survives a reload and stays within its budget", async () => {
   chat.dispose();
   assert.equal(new Chat(db, "s1", async () => "x").render(), rendered);
 });
+
+test("a failing compactor backs off, holds no message up, and reports it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  let fail = true;
+  const { chat } = open(async () => {
+    calls += 1;
+    if (fail) throw new Error("No model selected");
+    return "user: long";
+  });
+  for (let n = 0; n < 20; n += 1) chat.append("user", "z".repeat(2000));
+  await chat.settled();
+  const first = calls;
+  assert.ok(first <= 8, `${first} calls before the first pause`);
+  assert.equal(chat.stats().failing?.error, "No model selected");
+  // New messages during the pause start no calls.
+  chat.append("user", "z".repeat(2000));
+  await chat.settled();
+  assert.equal(calls, first);
+  // Each try after a pause is one call, and the pause doubles.
+  t.mock.timers.tick(30_000);
+  await new Promise(setImmediate);
+  assert.equal(calls, first + 1);
+  t.mock.timers.tick(59_999);
+  await new Promise(setImmediate);
+  assert.equal(calls, first + 1);
+  t.mock.timers.tick(1);
+  await new Promise(setImmediate);
+  assert.equal(calls, first + 2);
+  // Once the model works, the backlog drains and the status clears.
+  fail = false;
+  t.mock.timers.tick(120_000);
+  for (let n = 0; n < 50; n += 1) await new Promise(setImmediate);
+  assert.equal(chat.stats().failing, null);
+  assert.equal(chat.stats().pending, 0);
+  chat.dispose();
+});

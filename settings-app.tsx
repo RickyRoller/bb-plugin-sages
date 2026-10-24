@@ -70,7 +70,7 @@ function SagesSettings() {
           Writes each sage's memory and an acolyte's closing summary. A cheap,
           fast model is enough.{" "}
           {preferences.summaryModel === null
-            ? "Using bb's default until you pick one."
+            ? "Using each sage's own model until you pick one."
             : ""}
         </p>
         <div className="flex items-center gap-2">
@@ -80,7 +80,7 @@ function SagesSettings() {
               onChange={(value) => void save({ summaryModel: value })}
             />
           ) : (
-            <span className="text-sm text-muted-foreground">bb default</span>
+            <span className="text-sm text-muted-foreground">Each sage's model</span>
           )}
           {preferences.summaryModel !== null ? (
             <Button
@@ -88,7 +88,7 @@ function SagesSettings() {
               className="h-8 text-xs"
               onClick={() => void save({ summaryModel: null })}
             >
-              Use bb default
+              Use each sage's model
             </Button>
           ) : null}
         </div>
