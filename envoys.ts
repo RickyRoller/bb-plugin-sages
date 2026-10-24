@@ -94,6 +94,10 @@ export type EnvoyConfig = {
   issueHosts: string[];
   /** The permission mode an Envoy starts in unless explicitly chosen. */
   permissionMode: "accept-edits" | "auto" | "full";
+  /** Standing instructions for every Envoy; "" for none. */
+  instructions: string;
+  /** A sage's own Envoy instructions, which replace the global ones; "" for none. */
+  sageInstructions: (sageId: string) => string;
 };
 export const defaultEnvoyConfig: EnvoyConfig = {
   preparedProjects: [],
@@ -101,6 +105,8 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   handoffSpecialist: "",
   issueHosts: [],
   permissionMode: "full",
+  instructions: "",
+  sageInstructions: () => "",
 };
 
 function policy(handoff: string) {
@@ -110,6 +116,20 @@ All pull requests you open must be DRAFT (gh pr create --draft). Immediately aft
       ? `Attaching a PR also sets up a watcher automation you own, which checks it every few minutes. Once the PR is marked ready (by you on request, or by the user on GitHub), the watcher sends you a message starting "[PR ready]" and removes itself. Then hand the PR off with specialist_handoff to the ${handoff} specialist for review and CI follow-up: give it the PR URL and head commit, what the change does and why, the checks you ran and their results, and anything reviewers should know. It has its own instructions for the follow-up, so don't repeat or prescribe them. Hand off once per PR, only after that message.`
       : "No ready-PR handoff specialist is configured, so attached PRs are not watched; report when a PR is ready."
   } Envoy delegation is authorized within this task.`;
+}
+
+/** The policy plus the standing instructions that apply to this Envoy. */
+function instructionsFor(config: EnvoyConfig, envoy: Envoy) {
+  const own = envoy.reportTo ? config.sageInstructions(envoy.reportTo.sageId) : "";
+  const standing = own || config.instructions;
+  return [
+    policy(config.handoffSpecialist),
+    ...(standing
+      ? [
+          `Standing instructions for Envoys${own ? ` from the sage "${envoy.reportTo!.name}"` : ""}; the task's directive overrides them where they conflict:\n${standing}`,
+        ]
+      : []),
+  ].join("\n\n");
 }
 
 export async function registerEnvoys(
@@ -262,7 +282,7 @@ export async function registerEnvoys(
     const available = await specialists();
     const settings = await read();
     let context = [
-      policy(settings.handoffSpecialist),
+      instructionsFor(settings, envoy),
       available === null
         ? "Specialists are unavailable; report this limitation when delegation is needed."
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
@@ -929,7 +949,7 @@ export async function registerEnvoys(
         ? {
             tools: envoy.reportTo ? [PR_TOOL, REPORT_TOOL] : [PR_TOOL],
             skills: [],
-            instructions: policy(lastConfig.handoffSpecialist),
+            instructions: instructionsFor(lastConfig, envoy),
           }
         : { tools: [], skills: [] };
     },

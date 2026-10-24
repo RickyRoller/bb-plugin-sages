@@ -31,6 +31,8 @@ const sageSchema = z.object({
   topic: z.string(),
   /** Standing instructions given to the sage's agent. */
   instructions: z.string(),
+  /** Standing instructions for Envoys this sage starts; replace the global ones. */
+  envoyInstructions: z.string().default(""),
   /** The project the sage's turns start in by default, if one is assigned. */
   projectId: z.string().nullable().default(null),
   /** The thread of the sage's latest turn. */
@@ -75,6 +77,8 @@ const topicInput = z.string().trim().max(200);
 // bb truncates dynamic thread instructions at 4096 characters; the cap leaves
 // room for the name and topic lines that are sent with them.
 const instructionsInput = z.string().trim().max(3500);
+/** Envoy instructions share bb's 4096-character cap with the Envoy policy. */
+const envoyInstructionsInput = z.string().trim().max(2800);
 
 // The composer's NewThreadRequest. bb validates it in full at spawn; this
 // checks only what the plugin reads.
@@ -140,6 +144,7 @@ export const rpcContract = defineRpcContract({
       name: nameInput.optional(),
       topic: topicInput.optional(),
       instructions: instructionsInput.optional(),
+      envoyInstructions: envoyInstructionsInput.optional(),
       projectId: z.string().nullable().optional(),
     }),
     output: sageSchema,
@@ -357,6 +362,14 @@ export default async function plugin(bb: BbPluginApi) {
       },
       default: "full",
     },
+    envoyInstructions: {
+      type: "string",
+      experimental_multiline: true,
+      label: "Envoy instructions",
+      description:
+        "Standing instructions added to every Envoy's prompt, up to 2800 characters. A sage's own Envoy instructions (bb sages edit --envoy-instructions) replace these for Envoys it starts.",
+      default: "",
+    },
     envoyIssueHosts: {
       type: "string",
       label: "Envoy issue hosts",
@@ -384,6 +397,15 @@ export default async function plugin(bb: BbPluginApi) {
       handoffSpecialist: preferences.readyHandoffSpecialist,
       issueHosts: list(values.envoyIssueHosts.toLowerCase()),
       permissionMode: values.envoyPermissionMode as EnvoyConfig["permissionMode"],
+      instructions: values.envoyInstructions.trim().slice(0, 2800),
+      sageInstructions: (sageId) => {
+        // An acolyte's Envoys follow its lead's instructions unless it has its own.
+        const sage = sages.find((each) => each.id === sageId);
+        if (!sage) return "";
+        if (sage.envoyInstructions) return sage.envoyInstructions;
+        const lead = sages.find((each) => each.id === sage.parentId);
+        return lead?.envoyInstructions ?? "";
+      },
     };
   }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text));
 
@@ -1769,7 +1791,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb sages list [--json]",
     "  bb sages show <sage-id> [--json]",
     "  bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>] [--json]",
-    "  bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--project <project-id|none>] [--json]",
+    "  bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--envoy-instructions <text> | --envoy-instructions-file <path>] [--project <project-id|none>] [--json]",
     "  bb sages send <sage-id> (<message> | --message-file <path>) [--json]",
     "  bb sages lead <sage-id> <lead-sage-id|none> [--json]",
     "  bb sages remove <sage-id> [--json]",
@@ -1801,9 +1823,10 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "edit",
-        summary: "Change a sage's name, topic, instructions or project",
+        summary:
+          "Change a sage's name, topic, instructions, Envoy instructions or project",
         usage:
-          "bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--project <project-id|none>] [--json]",
+          "bb sages edit <sage-id> [--name <text>] [--topic <text>] [--instructions <text> | --instructions-file <path>] [--envoy-instructions <text> | --envoy-instructions-file <path>] [--project <project-id|none>] [--json]",
       },
       {
         name: "send",
@@ -1839,6 +1862,8 @@ export default async function plugin(bb: BbPluginApi) {
           arg === "--lead" ||
           arg === "--name" ||
           arg === "--instructions-file" ||
+          arg === "--envoy-instructions" ||
+          arg === "--envoy-instructions-file" ||
           arg === "--message-file"
         ) {
           const value = argv[(index += 1)];
@@ -1889,6 +1914,9 @@ export default async function plugin(bb: BbPluginApi) {
                   : `acolyte of: ${findSage(sage.parentId).name} (${sage.parentId})`,
                 `chat: ${stats.messages} messages, view ${stats.viewBytes} bytes, ${stats.pending} to summarize${sage.running ? ", working" : ""}`,
                 sage.instructions === "" ? null : `\n${sage.instructions}`,
+                sage.envoyInstructions === ""
+                  ? null
+                  : `\nEnvoy instructions:\n${sage.envoyInstructions}`,
               ]
                 .filter((line) => line !== null)
                 .join("\n"),
@@ -1933,12 +1961,23 @@ export default async function plugin(bb: BbPluginApi) {
               flags["instructions-file"] === undefined
                 ? flags.instructions
                 : await readText(flags["instructions-file"], ctx.cwd);
+            if (
+              flags["envoy-instructions"] !== undefined &&
+              flags["envoy-instructions-file"] !== undefined
+            ) {
+              break;
+            }
+            const envoyInstructions =
+              flags["envoy-instructions-file"] === undefined
+                ? flags["envoy-instructions"]
+                : await readText(flags["envoy-instructions-file"], ctx.cwd);
             const project = flags.project;
             const input = rpcContract.sages_update.input.safeParse({
               id: sageId,
               name: flags.name,
               topic: flags.topic,
               instructions,
+              envoyInstructions,
               projectId: project === "none" ? null : project,
             });
             if (!input.success) {

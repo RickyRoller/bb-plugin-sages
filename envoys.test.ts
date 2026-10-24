@@ -41,6 +41,8 @@ async function setup(
     prepare?: boolean;
     noHandoff?: boolean;
     issueHosts?: string[];
+    instructions?: string;
+    sageInstructions?: Record<string, string>;
   } = {},
 ) {
   /** The Automations plugin's records, as its RPCs see them. */
@@ -188,6 +190,8 @@ async function setup(
     handoffSpecialist: options.noHandoff ? "" : "ready-pr",
     issueHosts: options.issueHosts ?? [],
     permissionMode: "full",
+    instructions: options.instructions ?? "",
+    sageInstructions: (sageId) => options.sageInstructions?.[sageId] ?? "",
   }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }));
   async function sweep() {
     const service = harness.behavior.runService("envoy-recovery");
@@ -758,6 +762,41 @@ test("an Envoy reports to its sage only when it needs a decision and the user is
       s.reports.map((r) => [r.outcome, r.text]).slice(2),
       [["failed", "provider crashed"]],
     );
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("a sage's Envoy instructions replace the global ones for Envoys it starts", async () => {
+  const s = await setup({
+    instructions: "Global: run the full lint.",
+    sageInstructions: { "sage-1": "Sage: scoped lint only." },
+  });
+  try {
+    const plain = await s.create();
+    const fromSage = await s.helpers.createTask({
+      task: "Fix the search filter",
+      projectId: "project-1",
+      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+    });
+    const fromOther = await s.helpers.createTask({
+      task: "Fix the badge",
+      projectId: "project-1",
+      reportTo: { sageId: "sage-2", name: "Other" },
+    });
+    const spawns = s.harness.inspection.sdk.callsTo("threads.spawn").map((call) => (call[0] as any).input[0].text as string);
+    const instructions = (threadId: string, envoyId: string) =>
+      s.helpers.configure(
+        makePluginAgentConfigurationContext({ thread: { id: threadId }, pluginMetadata: { envoyId } }),
+      ).instructions ?? "";
+    for (const [envoy, spawn] of [[plain, spawns[0]!], [fromOther, spawns[2]!]] as const) {
+      assert.match(spawn, /Global: run the full lint\./);
+      assert.match(instructions(envoy.threadId!, envoy.id), /Global: run the full lint\./);
+    }
+    assert.match(spawns[1]!, /from the sage "Work Allocator".*\nSage: scoped lint only\./s);
+    assert.doesNotMatch(spawns[1]!, /Global/);
+    assert.match(instructions(fromSage.threadId!, fromSage.id), /Sage: scoped lint only\./);
+    assert.match(spawns[1]!, /All pull requests you open must be DRAFT/);
   } finally {
     await s.harness.lifecycle.dispose();
   }
