@@ -99,7 +99,9 @@ When you ask several acolytes things whose answers you will weigh together,
 give each of those messages the same round, a short name; a follow-up to one of
 them in the same round joins it. Each reply then ends by saying who the round
 is still waiting on, the last says it is complete, and open rounds are listed
-after the view. While a round is open, take each reply in briefly and keep its
+after the view. When you open a round, tell the user only whom you asked and
+about what, in a sentence or two: no plan, findings or questions yet. While a
+round is open, take each reply in with a sentence or two at most and keep its
 findings and questions for the end; meanwhile answer the user as usual. When it
 completes, reconcile all the replies at once and bring the user one summary and
 one set of asks. A round still open after 30 minutes closes with a note naming
