@@ -246,6 +246,20 @@ RPC (input `{}`), which refreshes every open sidebar. The Metro Control plugin
 is one such decorator. **Envoy badges** in the settings turns each source,
 the issue link included, on or off.
 
+Plugins that publish a discoverable `envoy-lifecycle.v1.changed` hear each
+time an Envoy is parked, resumed, completed or cancelled:
+
+```ts
+// input; the output is ignored
+{ envoy: { id; threadId: string | null; projectId; environmentId: string | null; lifecycle } }
+```
+
+A completed Envoy is announced before its thread is archived and its worktree
+retired, so its environment can still be read. A listener gets 3 seconds and
+should do slow work in the background; a failure is only logged. The Metro
+Control plugin listens to stop an Envoy's Metro and validation devices once
+it is parked, completed or cancelled.
+
 ## Mentions
 
 Type `@` in any composer to mention a sage. The picker lists each lead sage

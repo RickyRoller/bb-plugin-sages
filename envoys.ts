@@ -23,6 +23,15 @@ import { nudgeSidebar } from "./sidebar-section.ts";
 const PR_TOOL = "envoy_attach_pr";
 const REPORT_TOOL = "envoy_report";
 const WATCHER_PREFIX = "Envoy PR watcher: ";
+/**
+ * Plugins that publish this discoverable method hear each lifecycle change,
+ * with input `{ envoy: { id, threadId, projectId, environmentId, lifecycle } }`.
+ * A completed Envoy is announced before its thread is archived, so its
+ * environment can still be read. Listeners should answer at once and do slow
+ * work in the background.
+ */
+export const LIFECYCLE_METHOD = "envoy-lifecycle.v1.changed";
+const LISTENER_TIMEOUT_MS = 3_000;
 /** Starts the notice a watcher sends, so it reaches a completed Envoy. */
 const READY_MARKER = "[PR ready]";
 /**
@@ -547,6 +556,32 @@ export async function registerEnvoys(
         await bb.sdk.threads.stop({ threadId });
     }
   }
+  /** Tells lifecycle listeners about an Envoy; one that fails is only logged. */
+  async function announce(envoy: Envoy) {
+    const listeners = await bb.sdk.plugins
+      .experimental_discoverRpc({ method: LIFECYCLE_METHOD })
+      .catch(() => []);
+    const { id, threadId, projectId, environmentId, lifecycle } = envoy;
+    await Promise.all(
+      [...new Set(listeners.map((each) => each.pluginId))].map((pluginId) =>
+        bb.sdk.plugins
+          .callRpc({
+            pluginId,
+            method: LIFECYCLE_METHOD,
+            input: {
+              envoy: { id, threadId, projectId, environmentId, lifecycle },
+            },
+            outputSchema: z.unknown(),
+            signal: AbortSignal.timeout(LISTENER_TIMEOUT_MS),
+          })
+          .catch((error) =>
+            bb.log.warn(
+              `Envoy lifecycle listener ${pluginId} failed: ${errorText(error)}`,
+            ),
+          ),
+      ),
+    );
+  }
   async function lifecycle(
     id: string,
     state: "active" | "parked" | "completed" | "cancelled",
@@ -570,6 +605,7 @@ export async function registerEnvoys(
         await unwatch(envoy).catch((error) =>
           bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
         );
+        await announce(envoy);
         return envoy;
       }
       if (envoy.creation !== "ready" || !envoy.threadId)
@@ -609,12 +645,14 @@ export async function registerEnvoys(
         }
         if (envoy.lifecycle === "parked" || envoy.lifecycle === "completed")
           await rewatch(get(id));
+        await announce(get(id));
       } else if (state === "parked") {
         update(id, { lifecycle: state });
         await stopImplementation(envoy);
         await unwatch(envoy).catch((error) =>
           bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
         );
+        await announce(get(id));
       } else {
         // Completing closes the Envoy out: its output is kept, then its
         // thread is archived with its children and its worktree retired.
@@ -626,6 +664,7 @@ export async function registerEnvoys(
         await unwatch(envoy).catch((error) =>
           bb.log.warn(`could not remove PR watchers: ${errorText(error)}`),
         );
+        await announce(get(id));
         await bb.sdk.threads.archive({ threadId: envoy.threadId });
         return get(id);
       }
@@ -861,6 +900,7 @@ export async function registerEnvoys(
     if (envoy.lifecycle !== "cancelled" && context.initiator === "user") {
       const resumed = update(envoy.id, { lifecycle: "active" });
       void rewatch(resumed);
+      void announce(resumed);
       return { action: "proceed" };
     }
     return {

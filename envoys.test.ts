@@ -43,6 +43,8 @@ async function setup(
     issueHosts?: string[];
     instructions?: string;
     sageInstructions?: Record<string, string>;
+    /** Plugins listening for lifecycle changes, by plugin id. */
+    lifecycleListeners?: Record<string, (input: any) => unknown>;
   } = {},
 ) {
   /** The Automations plugin's records, as its RPCs see them. */
@@ -139,7 +141,14 @@ async function setup(
         output: async () => ({ output: "Fixed and verified" }),
       },
       plugins: {
+        experimental_discoverRpc: async () =>
+          Object.keys(options.lifecycleListeners ?? {}).map((pluginId) => ({
+            pluginId,
+            method: "envoy-lifecycle.v1.changed",
+          })) as any,
         callRpc: async (args) => {
+          if (args.method === "envoy-lifecycle.v1.changed")
+            return options.lifecycleListeners![args.pluginId]!(args.input);
           if (args.method === "specialists_list")
             return {
               specialists: options.missingSpecialist
@@ -498,6 +507,35 @@ test("completing saves the output and archives the thread; resuming unarchives, 
     assert.equal(s.harness.inspection.sdk.callsTo("threads.unarchive").length, 1);
     assert.equal(s.harness.inspection.sdk.callsTo("threads.restoreEnvironment").length, 1);
     assert.equal(s.automations.length, 1);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("lifecycle listeners hear each change, a completed Envoy before its thread is archived", async () => {
+  const heard: string[] = [];
+  const s: Awaited<ReturnType<typeof setup>> = await setup({
+    lifecycleListeners: {
+      "metro-control": ({ envoy }) => {
+        const archived = s.harness.inspection.sdk.callsTo("threads.archive").length;
+        heard.push(`${envoy.lifecycle}:${envoy.environmentId}:${archived}`);
+        return {};
+      },
+      broken: () => {
+        throw new Error("listener down");
+      },
+    },
+  });
+  try {
+    const envoy = await s.create();
+    for (const lifecycle of ["parked", "active", "completed", "cancelled"])
+      await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle });
+    assert.deepEqual(heard, [
+      "parked:environment-1:0",
+      "active:environment-1:0",
+      "completed:environment-1:0",
+      "cancelled:environment-1:1",
+    ]);
   } finally {
     await s.harness.lifecycle.dispose();
   }
