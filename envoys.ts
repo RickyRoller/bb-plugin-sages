@@ -18,6 +18,7 @@ import {
   type Envoy,
   type Specialist,
 } from "./envoy-contract.ts";
+import { nudgeSidebar } from "./sidebar-section.ts";
 
 const PR_TOOL = "envoy_attach_pr";
 const REPORT_TOOL = "envoy_report";
@@ -188,14 +189,7 @@ export async function registerEnvoys(
     );
     records.set(id, envoy);
     bb.realtime.publish("envoys-changed", {});
-    void bb.sdk.plugins
-      .callRpc({
-        pluginId: "sidebar-thread-details",
-        method: "refreshEnvoys",
-        input: {},
-        outputSchema: z.unknown(),
-      })
-      .catch(() => {});
+    nudgeSidebar(bb);
     return envoy;
   }
 
@@ -775,19 +769,6 @@ export async function registerEnvoys(
       const list = await specialists();
       return { specialists: list ?? [], available: list !== null };
     },
-    envoys_summaries: ({ threadIds }) => {
-      const ids = new Set(threadIds);
-      return {
-        envoys: [...records.values()]
-          .filter((e) => e.threadId && ids.has(e.threadId))
-          .map(({ id, threadId, lifecycle, issue }) => ({
-            id,
-            threadId,
-            lifecycle,
-            issue,
-          })),
-      };
-    },
   });
   bb.agents.registerTool({
     name: PR_TOOL,
@@ -942,6 +923,7 @@ export async function registerEnvoys(
 
   return {
     createTask,
+    list: () => records.values(),
     configure(context: PluginAgentConfigurationContext) {
       const envoy = records.get(String(context.pluginMetadata.envoyId ?? ""));
       return envoy &&

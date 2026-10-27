@@ -10,6 +10,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { Preferences, rpcContract } from "./server";
 import type { envoyRpcContract, Specialist } from "./envoy-contract";
+import type { badgeRpcContract } from "./sidebar-section";
 import { Button } from "@/components/ui/button";
 
 const SELECT =
@@ -35,7 +36,11 @@ async function defaultChoice(
 function SagesSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const envoyRpc = useRpc<typeof envoyRpcContract>();
+  const badgeRpc = useRpc<typeof badgeRpcContract>();
   const sdk = useSdk();
+  const [badgeSources, setBadgeSources] = useState<
+    { id: string; label: string }[] | null
+  >(null);
   const [preferences, setPreferences] = useState<Preferences | null>(null);
   const [fallback, setFallback] = useState<PickerValue | null>(null);
   const [specialists, setSpecialists] = useState<Specialist[] | null>(null);
@@ -49,8 +54,11 @@ function SagesSettings() {
     envoyRpc
       .call("envoys_specialists")
       .then((result) => setSpecialists(result.specialists), report);
+    badgeRpc
+      .call("envoys_badge_sources")
+      .then((result) => setBadgeSources(result.sources), report);
     defaultChoice(sdk).then(setFallback, () => {});
-  }, [rpc, envoyRpc, sdk, report]);
+  }, [rpc, envoyRpc, badgeRpc, sdk, report]);
 
   const save = (patch: Partial<Preferences>) =>
     rpc.call("sages_set_preferences", patch).then((next) => {
@@ -116,6 +124,34 @@ function SagesSettings() {
           ) : null}
         </select>
       </label>
+      <div className="space-y-2 text-sm">
+        <p className="font-medium">Envoy badges</p>
+        <p className="text-xs text-muted-foreground">
+          Shown on Envoy rows in the Sidebar Thread Details sidebar. Other
+          plugins add sources by publishing envoy-decorations.v1.get.
+        </p>
+        {(badgeSources ?? []).map((source) => {
+          const hidden = preferences.hiddenEnvoyBadges.includes(source.id);
+          return (
+            <label className="flex items-center gap-2" key={source.id}>
+              <input
+                checked={!hidden}
+                onChange={() =>
+                  void save({
+                    hiddenEnvoyBadges: hidden
+                      ? preferences.hiddenEnvoyBadges.filter(
+                          (id) => id !== source.id,
+                        )
+                      : [...preferences.hiddenEnvoyBadges, source.id],
+                  })
+                }
+                type="checkbox"
+              />
+              <span>{source.label}</span>
+            </label>
+          );
+        })}
+      </div>
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
     </div>
   );

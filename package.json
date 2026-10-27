@@ -54,7 +54,7 @@
     "vaul": "^1.1.2"
   },
   "scripts": {
-    "test": "node --import tsx --test optchat.test.ts harness.test.ts envoys.test.ts source-preparation.test.ts envoys-app.test.mjs",
+    "test": "node --import tsx --test optchat.test.ts harness.test.ts envoys.test.ts source-preparation.test.ts sidebar-section.test.ts mentions.test.ts envoys-app.test.mjs",
     "typecheck": "tsc --noEmit"
   }
 }

@@ -24,6 +24,7 @@ preset; when the user asks for a sage or an acolyte, use `bb sages`.
 | `bb sages list` | Show every sage with its id and topic. |
 | `bb sages show <sage-id>` | Show one sage, its instructions, and the size of its chat. |
 | `bb sages create <name> [--topic <text>] [--instructions <text>] [--project <project-id>] [--lead <sage-id>]` | Create a sage. Quote values that have spaces. `--project` assigns the project its turns start in; get ids from `bb project list`. `--lead` makes it an acolyte of that sage. |
+| `bb sages send <sage-id> (<message> \| --message-file <path>)` | Send a sage a message: a fresh turn, or into the running one. |
 | `bb sages lead <sage-id> <lead-id\|none>` | Make a sage an acolyte of a lead, or its own lead again. |
 | `bb sages remove <sage-id>` | Delete a sage and its whole chat. This cannot be undone. |
 
@@ -33,8 +34,9 @@ Add `--json` to any command when the output drives code.
 
 - Run `bb sages list` first and use the ids it prints; never guess an id.
 - Limits: name 80 characters, topic 200, instructions 3500.
-- The CLI does not send messages to a sage or edit an existing sage; the user
-  does those on the Sages page.
+- `bb sages send <sage-id> --message-file -` sends a sage a message; it answers
+  in its own chat, not in yours. When the user @mentions a sage, its id is in
+  the mention.
 - `bb sages list` shows active acolytes (sages under a lead sage) indented
   under their lead, marked `↳`. To create a lead with acolytes, create the
   lead first, then create each acolyte with `--lead <lead-id>` from the

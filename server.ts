@@ -14,6 +14,8 @@ import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
 import { ENVOY_USAGE, registerEnvoys, type EnvoyConfig } from "./envoys.ts";
 import type { Envoy } from "./envoy-contract.ts";
+import { nudgeSidebar, registerSidebarSection } from "./sidebar-section.ts";
+import { mentionContext, mentionItems } from "./mentions.ts";
 import { MissingCli, runDirect, type ModelChoice } from "./harness.ts";
 import {
   COMPACTION_PROMPT,
@@ -108,6 +110,8 @@ const preferencesSchema = z.object({
   summaryModel: summaryModelSchema.default(null),
   /** The specialist started when an Envoy's attached PR is ready; "" for none. */
   readyHandoffSpecialist: z.string().default(""),
+  /** Envoy badge sources left off sidebar rows: "issue" or a plugin id. */
+  hiddenEnvoyBadges: z.array(z.string().max(200)).max(100).default([]),
 });
 export type Preferences = z.infer<typeof preferencesSchema>;
 
@@ -121,6 +125,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       summaryModel: summaryModelSchema.optional(),
       readyHandoffSpecialist: z.string().optional(),
+      hiddenEnvoyBadges: z.array(z.string().max(200)).max(100).optional(),
     }),
     output: preferencesSchema,
   },
@@ -427,10 +432,17 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish(SAGES_CHANGED, { count: sages.length });
     }, 300);
   }
+  /** What the sidebar's Sages section shows, to tell when it needs news. */
+  const sidebarView = (list: Sage[]) =>
+    JSON.stringify(
+      list.map(({ id, name, parentId, archivedAt }) => [id, name, parentId, archivedAt]),
+    );
   async function writeSages(next: Sage[]): Promise<void> {
+    const shown = sidebarView(sages);
     await bb.storage.kv.set("sages", next);
     sages = next;
     publish();
+    if (sidebarView(next) !== shown) nudgeSidebar(bb);
   }
   function findSage(id: string): Sage {
     const sage = sages.find((candidate) => candidate.id === id);
@@ -680,7 +692,7 @@ export default async function plugin(bb: BbPluginApi) {
     chats.delete(id);
     await bb.storage.kv.delete(`cursor:${id}`);
     await writeSages(sages.filter((sage) => sage.id !== id));
-    nudgeSidebar();
+    nudgeSidebar(bb);
     return true;
   }
 
@@ -900,21 +912,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --- Acolytes ---
 
-  /**
-   * Tells the sidebar's Sages section, which loads only on demand, that the
-   * acolytes changed. Without that plugin there is nothing to tell.
-   */
-  function nudgeSidebar(): void {
-    bb.sdk.plugins
-      .callRpc({
-        pluginId: "sidebar-thread-details",
-        method: "refreshSages",
-        input: {},
-        outputSchema: z.unknown(),
-      })
-      .catch(() => {});
-  }
-
   async function openAcolyte(
     parentId: string,
     name: string,
@@ -956,7 +953,7 @@ export default async function plugin(bb: BbPluginApi) {
       updatedAt: now,
     });
     await writeSages([...sages, acolyte]);
-    nudgeSidebar();
+    nudgeSidebar(bb);
     const about = [
       focus === "" ? null : `Focus: ${focus}`,
       brief ??
@@ -1022,7 +1019,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
     }
     await updateSage(id, { parentId, archivedAt: null, closing: false });
-    nudgeSidebar();
+    nudgeSidebar(bb);
   }
 
   /** The acolyte's chat, written down for its main chat by the cheap model. */
@@ -1057,7 +1054,7 @@ export default async function plugin(bb: BbPluginApi) {
       closing: false,
       running: false,
     });
-    nudgeSidebar();
+    nudgeSidebar(bb);
     return archived;
   }
 
@@ -1118,7 +1115,7 @@ export default async function plugin(bb: BbPluginApi) {
       acolyteHead(acolyte, "reopened"),
     );
     const reopened = await updateSage(id, { archivedAt: null });
-    nudgeSidebar();
+    nudgeSidebar(bb);
     return reopened;
   }
 
@@ -1439,12 +1436,42 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  /** Puts sages in this order; ids left out keep their place after these. */
+  async function reorderSages(ids: string[]): Promise<string[]> {
+    const rank = new Map(ids.map((id, index) => [id, index]));
+    const ordered = [...sages].sort(
+      (a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity),
+    );
+    await writeSages(ordered);
+    return ordered.map((sage) => sage.id);
+  }
+
+  bb.ui.registerMentionProvider({
+    id: "sage",
+    label: "Sages",
+    search: ({ query }) => mentionItems(sages, query),
+    // Runs at send time; a throw blocks the send with this message.
+    resolve(itemId) {
+      const sage = findSage(itemId);
+      const lead = sages.find((each) => each.id === sage.parentId);
+      return { context: mentionContext(sage, lead) };
+    },
+  });
+
+  registerSidebarSection(bb, {
+    sages: () => sages,
+    reorderSages,
+    envoys: () => envoys.list(),
+    hiddenBadges: () => preferences.hiddenEnvoyBadges,
+  });
+
   bb.rpc.register(rpcContract, {
     sages_preferences: () => preferences,
     sages_set_preferences: async (patch) => {
       const next = preferencesSchema.parse({ ...preferences, ...patch });
       await bb.storage.kv.set("preferences", next);
       preferences = next;
+      if (patch.hiddenEnvoyBadges) nudgeSidebar(bb);
       return preferences;
     },
     sages_list: () => ({
@@ -1487,14 +1514,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!done) sent.catch(() => {});
       return { sage: findSage(id), pending: !done };
     },
-    sages_reorder: async ({ ids }) => {
-      const rank = new Map(ids.map((id, index) => [id, index]));
-      const ordered = [...sages].sort(
-        (a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity),
-      );
-      await writeSages(ordered);
-      return { ids: ordered.map((sage) => sage.id) };
-    },
+    sages_reorder: async ({ ids }) => ({ ids: await reorderSages(ids) }),
     sages_stop: async ({ id }) => {
       const { threadId, running } = findSage(id);
       if (!running || threadId === null) return { ok: false };

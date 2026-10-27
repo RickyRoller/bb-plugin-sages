@@ -194,19 +194,6 @@ export const envoyRpcContract = defineRpcContract({
       available: z.boolean(),
     }),
   },
-  envoys_summaries: {
-    input: z.object({ threadIds: z.array(z.string()).max(1000) }),
-    output: z.object({
-      envoys: z.array(
-        envoySchema.pick({
-          id: true,
-          threadId: true,
-          lifecycle: true,
-          issue: true,
-        }),
-      ),
-    }),
-  },
 });
 export const envoyHostContract = defineRpcContract({
   prepareSource: {

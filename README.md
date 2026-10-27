@@ -14,6 +14,8 @@ instructions, and one chat that never ends.
 - `app.tsx` — the frontend: a **Sages** page in the left sidebar. Its root
   lists and creates sages; `/plugins/sages/sages/<sage-id>` is that sage's
   chat.
+- `sidebar-section.ts` — the Sages and Envoys sections of the Sidebar Thread
+  Details sidebar, and the Envoy badge hook (see "Sidebar and Envoy badges").
 - `skills/sages/SKILL.md` — tells agents how to use `bb sages`.
 - `PLUGIN_OVERVIEW.md` — the store listing text.
 
@@ -206,6 +208,51 @@ during a turn steer it as in any thread.
   names its thread instead), imported memories (`note`), and images in
   `sage_zoom`.
 
+## Sidebar and Envoy badges
+
+Sidebar Thread Details draws whatever section providers return, so this plugin
+owns its sidebar sections. It publishes the discoverable RPC
+`sidebar-section.v1.get`: a **Sages** section (root sages with their open
+acolytes, reordered with `sidebar-section.v1.reorder`) and an **Envoys**
+section claiming each Envoy's thread. Whatever changes a section (a sage
+added, renamed, moved or removed, an acolyte opened or closed, an Envoy
+updated, a badge source changed) calls the sidebar's `refreshSections` RPC, at
+most once per 300 ms, so the sidebar updates without a manual refresh. Envoys
+sort by latest activity: each turn that starts or ends in an Envoy's thread or
+any thread under it is reported as the row's `activityAt`. Activity is
+published at most once every 30 seconds for all Envoys together, so rows do
+not jump around while tasks work.
+
+Each Envoy row carries badges on the line under its title. The issue link is
+built in and comes first; other plugins add
+their own by publishing a discoverable `envoy-decorations.v1.get`:
+
+```ts
+// input
+{ envoys: { id; threadId: string | null; projectId; environmentId: string | null; lifecycle }[] }
+// output: up to 4 badges per Envoy
+{ decorations: { envoyId: string; badges: {
+  label: string;                // ≤ 40 chars
+  tone?: "neutral" | "info" | "success" | "warning" | "danger";
+  placement?: "title" | "meta"; // default "meta", the line under the title
+  href?: string | null;         // https only
+  title?: string | null;        // tooltip
+}[] }[] }
+```
+
+A decorator gets 3 seconds; a failure, late answer or malformed row adds
+nothing. When its data changes it calls this plugin's `envoys_badges_changed`
+RPC (input `{}`), which refreshes every open sidebar. The Metro Control plugin
+is one such decorator. **Envoy badges** in the settings turns each source,
+the issue link included, on or off.
+
+## Mentions
+
+Type `@` in any composer to mention a sage. The picker lists each lead sage
+followed by its open acolytes, whose rows read "Acolyte of <lead>". A mention
+tells the agent which sage you mean, its topic, and that `bb sages send`
+reaches it.
+
 ## Settings
 
 The plugin's settings page has a **Models and handoff** section built from what
@@ -215,6 +262,7 @@ bb already has set up:
   acolyte summaries. Unset, they run on bb's default.
 - **Ready-PR handoff specialist**: a list of your Specialists. An Envoy hands its
   PR to it once the PR is marked ready; with none, attached PRs get no watcher.
+- **Envoy badges**: the badge sources shown on Envoy rows in the sidebar.
 
 The remaining fields:
 
