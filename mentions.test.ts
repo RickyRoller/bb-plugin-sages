@@ -33,6 +33,6 @@ test("a matching lead brings its acolytes; a matching acolyte comes alone", () =
 test("an acolyte's mention names its lead and how to reach it", () => {
   const text = mentionContext(sages[1]!, sages[0]);
   assert.match(text, /acolyte sage "Swaps" \(id swaps\), which works under the lead sage "Wallet" \(id wallet\)/);
-  assert.match(text, /bb sages send swaps --message-file -/);
+  assert.match(text, /bb sages send swaps --message-file <path>/);
   assert.doesNotMatch(mentionContext(sages[3]!, undefined), /lead/);
 });

@@ -34,8 +34,10 @@ Add `--json` to any command when the output drives code.
 
 - Run `bb sages list` first and use the ids it prints; never guess an id.
 - Limits: name 80 characters, topic 200, instructions 3500.
-- `bb sages send <sage-id> --message-file -` sends a sage a message; it answers
-  in its own chat, not in yours. When the user @mentions a sage, its id is in
+- `bb sages send <sage-id> --message-file <path>` sends a sage a message; it
+  answers in its own chat, not in yours. Write the message to a file first
+  (`cat > <path> <<'EOF'`); `--message-file -` does not read stdin, because
+  plugin commands run in the bb daemon and never see the caller's stdin. When the user @mentions a sage, its id is in
   the mention.
 - `bb sages list` shows active acolytes (sages under a lead sage) indented
   under their lead, marked `↳`. To create a lead with acolytes, create the

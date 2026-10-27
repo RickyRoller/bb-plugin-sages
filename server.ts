@@ -1891,6 +1891,13 @@ export default async function plugin(bb: BbPluginApi) {
     ...ENVOY_USAGE.split("\n").slice(1),
   ].join("\n");
   async function readText(path: string, cwd: string | undefined) {
+    // Plugin commands run in the bb daemon, so the caller's stdin never
+    // reaches them; `-` would otherwise read a file literally named "-".
+    if (path === "-") {
+      throw new Error(
+        "bb can't pass multi-line stdin to a plugin command; write the text to a file and pass its path",
+      );
+    }
     return readFile(resolve(cwd ?? process.cwd(), path), "utf8");
   }
   function formatSage(sage: Sage): string {
@@ -2156,9 +2163,12 @@ export default async function plugin(bb: BbPluginApi) {
           }
         }
       } catch (cause) {
+        const text = errorText(cause);
         return {
           exitCode: 1,
-          stderr: `${errorText(cause)}. Run "bb sages list" to see ids.`,
+          stderr: text.startsWith("No sage with id")
+            ? `${text}. Run "bb sages list" to see ids.`
+            : `${text}.`,
         };
       }
       return { exitCode: 1, stderr: usage };

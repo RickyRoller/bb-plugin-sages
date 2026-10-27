@@ -65,7 +65,7 @@ export function mentionContext(
   return [
     `The user mentioned ${who}.`,
     sage.topic ? `Its topic: ${sage.topic}` : "",
-    `A sage is a lasting chat with its own memory. To ask it something or pass it information, run \`bb sages send ${sage.id} --message-file -\` with the message on stdin; it answers in its own chat, not here. \`bb sages show ${sage.id}\` shows its instructions.`,
+    `A sage is a lasting chat with its own memory. To ask it something or pass it information, write the message to a file (a quoted heredoc, \`<<'EOF'\`, keeps the shell from expanding it) and run \`bb sages send ${sage.id} --message-file <path>\`; stdin (\`-\`) does not work. It answers in its own chat, not here. \`bb sages show ${sage.id}\` shows its instructions.`,
   ]
     .filter(Boolean)
     .join("\n");
