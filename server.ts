@@ -1804,7 +1804,14 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "The project's id or name; this turn's project when left out",
         ),
-      name: z.string().trim().max(80).optional(),
+      name: z
+        .string()
+        .trim()
+        .max(80)
+        .optional()
+        .describe(
+          "A few words naming the task. Leave out the issue key: the issue link is shown beside the name",
+        ),
       issueUrl: z.string().trim().max(2000).optional().describe("A full https issue link"),
       specialist: z
         .string()
