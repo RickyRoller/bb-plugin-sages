@@ -108,6 +108,8 @@ const summaryModelSchema = z
 /** Choices made with bb's own pickers, so they follow what bb has set up. */
 const preferencesSchema = z.object({
   summaryModel: summaryModelSchema.default(null),
+  /** The model Envoys run on unless chosen or set by a lead; null for bb's default. */
+  envoyModel: summaryModelSchema.default(null),
   /** The specialist started when an Envoy's attached PR is ready; "" for none. */
   readyHandoffSpecialist: z.string().default(""),
   /** Envoy badge sources left off sidebar rows: "issue" or a plugin id. */
@@ -124,6 +126,7 @@ export const rpcContract = defineRpcContract({
     // No defaults here: a field left out keeps its saved value.
     input: z.object({
       summaryModel: summaryModelSchema.optional(),
+      envoyModel: summaryModelSchema.optional(),
       readyHandoffSpecialist: z.string().optional(),
       hiddenEnvoyBadges: z.array(z.string().max(200)).max(100).optional(),
     }),
@@ -414,6 +417,7 @@ export default async function plugin(bb: BbPluginApi) {
         const lead = sages.find((each) => each.id === sage.parentId);
         return lead?.envoyInstructions ?? "";
       },
+      model: preferences.envoyModel,
     };
   }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text));
 

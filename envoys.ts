@@ -108,6 +108,13 @@ export type EnvoyConfig = {
   instructions: string;
   /** A sage's own Envoy instructions, which replace the global ones; "" for none. */
   sageInstructions: (sageId: string) => string;
+  /** The model an Envoy runs on unless chosen or set by its lead; null for bb's default. */
+  model: {
+    providerId: string;
+    model: string;
+    reasoningLevel: string;
+    serviceTier?: string;
+  } | null;
 };
 export const defaultEnvoyConfig: EnvoyConfig = {
   preparedProjects: [],
@@ -117,6 +124,7 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   permissionMode: "full",
   instructions: "",
   sageInstructions: () => "",
+  model: null,
 };
 
 function policy(handoff: string) {
@@ -329,6 +337,26 @@ export async function registerEnvoys(
     ) {
       execution.reasoningLevel = launch.lead.reasoningLevel;
       sources.reasoningLevel = "explicit";
+    }
+    // Without an explicit pair or a lead's model, the Envoy model setting applies.
+    if (
+      !explicitPair &&
+      !launch.lead?.providerId &&
+      !launch.lead?.model &&
+      settings.model
+    ) {
+      execution.providerId = settings.model.providerId;
+      execution.model = settings.model.model;
+      sources.providerId = "explicit";
+      sources.model = "explicit";
+      if (sources.reasoningLevel !== "explicit") {
+        execution.reasoningLevel = settings.model.reasoningLevel as typeof execution.reasoningLevel;
+        sources.reasoningLevel = "explicit";
+      }
+      if (settings.model.serviceTier && sources.serviceTier !== "explicit") {
+        execution.serviceTier = settings.model.serviceTier;
+        sources.serviceTier = "explicit";
+      }
     }
     // An explicit choice in the composer wins; otherwise the setting applies.
     if (sources.permissionMode !== "explicit") {

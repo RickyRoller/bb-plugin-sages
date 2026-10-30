@@ -69,6 +69,7 @@ function SagesSettings() {
   if (preferences === null)
     return <p className="text-sm text-muted-foreground">{error ?? "Loading…"}</p>;
   const summaryModel = (preferences.summaryModel as PickerValue | null) ?? fallback;
+  const envoyModel = (preferences.envoyModel as PickerValue | null) ?? fallback;
   const handoff = preferences.readyHandoffSpecialist;
   return (
     <div className="flex flex-col gap-5">
@@ -97,6 +98,35 @@ function SagesSettings() {
               onClick={() => void save({ summaryModel: null })}
             >
               Use each sage's model
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <div className="space-y-2">
+        <p className="text-sm font-medium">Envoy model</p>
+        <p className="text-xs text-muted-foreground">
+          Runs new Envoys unless the composer picks a model or a lead
+          specialist sets one.{" "}
+          {preferences.envoyModel === null
+            ? "Using bb's default model until you pick one."
+            : ""}
+        </p>
+        <div className="flex items-center gap-2">
+          {envoyModel ? (
+            <ProviderModelPicker
+              value={envoyModel}
+              onChange={(value) => void save({ envoyModel: value })}
+            />
+          ) : (
+            <span className="text-sm text-muted-foreground">bb's default model</span>
+          )}
+          {preferences.envoyModel !== null ? (
+            <Button
+              variant="ghost"
+              className="h-8 text-xs"
+              onClick={() => void save({ envoyModel: null })}
+            >
+              Use bb's default
             </Button>
           ) : null}
         </div>

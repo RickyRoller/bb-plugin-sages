@@ -6,7 +6,7 @@ import {
   makePluginAgentConfigurationContext,
   makeMessageDispatchHookContext,
 } from "@get-bb/plugin-sdk/testing";
-import { registerEnvoys, WATCHER_SCRIPT } from "./envoys.ts";
+import { registerEnvoys, WATCHER_SCRIPT, type EnvoyConfig } from "./envoys.ts";
 import { githubPr, issueLink } from "./envoy-contract.ts";
 
 const specialist = {
@@ -43,6 +43,7 @@ async function setup(
     issueHosts?: string[];
     instructions?: string;
     sageInstructions?: Record<string, string>;
+    model?: EnvoyConfig["model"];
     /** Plugins listening for lifecycle changes, by plugin id. */
     lifecycleListeners?: Record<string, (input: any) => unknown>;
   } = {},
@@ -201,6 +202,7 @@ async function setup(
     permissionMode: "full",
     instructions: options.instructions ?? "",
     sageInstructions: (sageId) => options.sageInstructions?.[sageId] ?? "",
+    model: options.model ?? null,
   }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }));
   async function sweep() {
     const service = harness.behavior.runService("envoy-recovery");
@@ -837,6 +839,48 @@ test("a sage's Envoy instructions replace the global ones for Envoys it starts",
     assert.match(spawns[1]!, /All pull requests you open must be DRAFT/);
   } finally {
     await s.harness.lifecycle.dispose();
+  }
+});
+
+test("the Envoy model setting applies unless the composer or a lead chose a model", async () => {
+  const model = { providerId: "claude-code", model: "envoy-model", reasoningLevel: "medium" };
+  const s = await setup({ model });
+  try {
+    await s.helpers.createTask({ task: "From a sage", projectId: "project-1" });
+    await s.harness.behavior.callRpc("envoys_create", {
+      ...request,
+      requestId: "explicit",
+      request: {
+        ...request.request,
+        providerId: "codex",
+        model: "user-model",
+        executionInputSources: { providerId: "explicit", model: "explicit" },
+      },
+    });
+    const spawns = s.harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .map((call) => call[0] as any);
+    assert.deepEqual(
+      spawns.map((args) => [args.providerId, args.model]),
+      [["claude-code", "envoy-model"], ["codex", "user-model"]],
+    );
+    assert.equal(spawns[0].reasoningLevel, "medium");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+  const led = await setup({ lead: true, model });
+  try {
+    await led.helpers.createTask({
+      task: "Led",
+      projectId: "project-1",
+      specialist: "ready-pr",
+    });
+    const args = led.harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .at(-1)![0] as any;
+    assert.equal(args.model, "lead-model");
+  } finally {
+    await led.harness.lifecycle.dispose();
   }
 });
 
