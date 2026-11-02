@@ -940,6 +940,7 @@ export async function registerEnvoys(
     try {
       const cancelledParent = [...records.values()].find(
         (e) =>
+          e.threadId !== null &&
           e.threadId === thread.parentThreadId && e.lifecycle === "cancelled",
       );
       if (cancelledParent) {

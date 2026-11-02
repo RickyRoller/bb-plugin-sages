@@ -968,3 +968,41 @@ test("the watcher script tells the Envoy once its PR is ready, then removes itse
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+
+test("a cancelled Envoy without a thread must not stop unrelated root threads", async () => {
+  const s = await setup({ spawnError: new Error("Response lost") });
+  try {
+    const uncertain = await s.create();
+    const cancelled = await s.harness.behavior.callRpc("envoys_lifecycle", {
+      id: uncertain.id, lifecycle: "cancelled",
+    }) as any;
+    assert.equal(cancelled.threadId, null);
+    const before = s.harness.inspection.sdk.callsTo("threads.stop").length;
+    await s.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: "unrelated-root", parentThreadId: null, status: "active" }),
+    });
+    assert.equal(s.harness.inspection.sdk.callsTo("threads.stop").length, before);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("a cancelled Envoy still stops its child threads", async () => {
+  const s = await setup();
+  try {
+    const envoy = await s.create();
+    await s.harness.behavior.callRpc("envoys_lifecycle", {
+      id: envoy.id, lifecycle: "cancelled",
+    });
+    const before = s.harness.inspection.sdk.callsTo("threads.stop").length;
+    await s.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: "cancelled-child", parentThreadId: envoy.threadId, status: "active" }),
+    });
+    const calls = s.harness.inspection.sdk.callsTo("threads.stop");
+    assert.equal(calls.length, before + 1);
+    assert.equal((calls.at(-1)![0] as any).threadId, "cancelled-child");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
