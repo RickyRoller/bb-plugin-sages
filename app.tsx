@@ -862,8 +862,9 @@ function Transcript({
   return (
     <ThreadMentions.Provider value={mentions}>
       {/* Wide tables and code scroll sideways in place, as in bb's chats,
-        rather than running off a phone's screen. */}
-      <div className="flex min-w-0 flex-col gap-4 py-4 break-words [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto [&_a[href*='/threads/']]:inline-block [&_a[href*='/threads/']]:max-w-full [&_a[href*='/threads/']]:truncate [&_a[href*='/threads/']]:align-bottom [&_a[href*='/threads/']]:rounded-md [&_a[href*='/threads/']]:bg-muted [&_a[href*='/threads/']]:px-1.5 [&_a[href*='/threads/']]:py-0.5 [&_a[href*='/threads/']]:text-[0.9em] [&_a[href*='/threads/']]:font-medium [&_a[href*='/threads/']]:text-foreground [&_a[href*='/threads/']]:no-underline [&_a[href*='/threads/']]:hover:bg-accent">
+        rather than running off a phone's screen. Cells keep a minimum width,
+        or a table squeezes its columns to fit and never has to scroll. */}
+      <div className="flex min-w-0 flex-col gap-4 py-4 break-words [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto [&_th]:min-w-32 [&_td]:min-w-32 [&_a[href*='/threads/']]:inline-block [&_a[href*='/threads/']]:max-w-full [&_a[href*='/threads/']]:truncate [&_a[href*='/threads/']]:align-bottom [&_a[href*='/threads/']]:rounded-md [&_a[href*='/threads/']]:bg-muted [&_a[href*='/threads/']]:px-1.5 [&_a[href*='/threads/']]:py-0.5 [&_a[href*='/threads/']]:text-[0.9em] [&_a[href*='/threads/']]:font-medium [&_a[href*='/threads/']]:text-foreground [&_a[href*='/threads/']]:no-underline [&_a[href*='/threads/']]:hover:bg-accent">
         {more ? (
           <Button
             variant="ghost"
