@@ -74,7 +74,20 @@ const statsSchema = z.object({
     .object({ error: z.string(), failures: z.number(), retryAt: z.string() })
     .nullable(),
 });
-const listedSageSchema = sageSchema.extend({ stats: statsSchema });
+/** A specialist a sage handed work to: running, or finished in the last moments. */
+const specialistRunSchema = z.object({
+  threadId: z.string(),
+  name: z.string(),
+  model: z.string().nullable(),
+  status: z.enum(["running", "done", "failed"]),
+  startedAt: z.number(),
+  endedAt: z.number().nullable(),
+});
+export type SpecialistRun = z.infer<typeof specialistRunSchema>;
+const listedSageSchema = sageSchema.extend({
+  stats: statsSchema,
+  specialists: z.array(specialistRunSchema),
+});
 export type ListedSage = z.infer<typeof listedSageSchema>;
 
 const nameInput = z.string().trim().min(1).max(80);
@@ -263,14 +276,16 @@ function specialistsText(specialists: Specialist[] | null): string {
   if (specialists.length === 0) return "Specialists: none are set up.";
   return [
     "Specialists you can hand work to with sage_handoff:",
-    ...specialists.map((each) => {
-      const model =
-        each.model === null
-          ? "project default model"
-          : `${each.providerId === null ? "" : `${each.providerId}/`}${each.model}${each.reasoningLevel === null ? "" : ` (${each.reasoningLevel})`}`;
-      return `- ${each.name} [${model}]: ${each.description || "no description"}`;
-    }),
+    ...specialists.map(
+      (each) =>
+        `- ${each.name} [${modelLabel(each) ?? "project default model"}]: ${each.description || "no description"}`,
+    ),
   ].join("\n");
+}
+function modelLabel(each: Specialist): string | null {
+  return each.model === null
+    ? null
+    : `${each.providerId === null ? "" : `${each.providerId}/`}${each.model}${each.reasoningLevel === null ? "" : ` (${each.reasoningLevel})`}`;
 }
 /** bb's cap on one page of thread events. */
 const EVENT_PAGE = 100;
@@ -1146,6 +1161,9 @@ export default async function plugin(bb: BbPluginApi) {
     specialist: string;
     /** For an acolyte asked as part of a round: the round's key and the acolyte. */
     round?: { key: string; acolyte: string };
+    /** For a specialist: when it was handed the work, and on what model. */
+    startedAt?: number;
+    model?: string | null;
   }
   const workers = new Map(
     Object.entries(
@@ -1154,6 +1172,28 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const saveWorkers = () =>
     bb.storage.kv.set("workers", Object.fromEntries(workers));
+  /** Specialists that just finished, shown a little longer, by thread id. */
+  const finished = new Map<string, SpecialistRun & { sageId: string }>();
+  const LINGER_MS = 30_000;
+  /** The specialists a sage's header shows: running ones, then recent ends. */
+  function specialistRuns(sageId: string): SpecialistRun[] {
+    const running = [...workers]
+      .filter(
+        ([, worker]) => worker.sageId === sageId && worker.startedAt != null,
+      )
+      .map(([threadId, worker]) => ({
+        threadId,
+        name: worker.specialist,
+        model: worker.model ?? null,
+        status: "running" as const,
+        startedAt: worker.startedAt!,
+        endedAt: null,
+      }));
+    const ended = [...finished.values()]
+      .filter((run) => run.sageId === sageId)
+      .map(({ sageId: _sageId, ...run }) => run);
+    return [...running, ...ended];
+  }
 
   /**
    * Acolyte messages a sage sent as one round, until every acolyte in it has
@@ -1305,6 +1345,22 @@ export default async function plugin(bb: BbPluginApi) {
     if (worker === undefined) return;
     workers.delete(threadId);
     saveWorkers().catch(() => {});
+    if (worker.startedAt != null) {
+      finished.set(threadId, {
+        sageId: worker.sageId,
+        threadId,
+        name: worker.specialist,
+        model: worker.model ?? null,
+        status: outcome === "failed" ? "failed" : "done",
+        startedAt: worker.startedAt,
+        endedAt: Date.now(),
+      });
+      publish();
+      setTimeout(() => {
+        finished.delete(threadId);
+        publish();
+      }, LINGER_MS).unref?.();
+    }
     // A report for a closed acolyte goes to its main chat instead.
     let sage = sages.find((candidate) => candidate.id === worker.sageId);
     if (sage?.archivedAt != null && sage.parentId !== null) {
@@ -1479,7 +1535,11 @@ export default async function plugin(bb: BbPluginApi) {
       return preferences;
     },
     sages_list: () => ({
-      sages: sages.map((sage) => ({ ...sage, stats: chatOf(sage.id).stats() })),
+      sages: sages.map((sage) => ({
+        ...sage,
+        stats: chatOf(sage.id).stats(),
+        specialists: specialistRuns(sage.id),
+      })),
     }),
     sages_create: (input) => createUnder(input),
     sages_update: async ({ id, parentId, ...patch }) => {
@@ -1627,7 +1687,10 @@ export default async function plugin(bb: BbPluginApi) {
       toolResult(async () => {
         const sage = await sageOfTurn(threadId);
         const sageId = sage.id;
-        const turn = await bb.sdk.threads.get({ threadId });
+        const [turn, known] = await Promise.all([
+          bb.sdk.threads.get({ threadId }),
+          listSpecialists(),
+        ]);
         // No parent thread: bb would report the result to this turn's
         // thread, which a later message may have replaced. The report is
         // delivered to the sage's chat instead.
@@ -1643,8 +1706,17 @@ export default async function plugin(bb: BbPluginApi) {
           },
           outputSchema: z.object({ threadId: z.string() }),
         });
-        workers.set(workerId, { sageId, specialist });
+        const listed = known?.find(
+          (each) => each.name.toLowerCase() === specialist.toLowerCase(),
+        );
+        workers.set(workerId, {
+          sageId,
+          specialist,
+          startedAt: Date.now(),
+          model: listed === undefined ? null : modelLabel(listed),
+        });
         await saveWorkers();
+        publish();
         return [
           `Handed off to ${specialist} in thread ${workerId} (reference it to the user as @thread:${workerId}).`,
           `Its report reaches this chat as a message starting "[${specialist}]". Do not wait for it or do its work meanwhile.`,

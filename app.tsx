@@ -29,7 +29,11 @@ import {
   type NewThreadRequest,
   type PluginNavPanelProps,
 } from "@get-bb/plugin-sdk/app";
-import type { ListedSage as Sage, rpcContract } from "./server";
+import type {
+  ListedSage as Sage,
+  rpcContract,
+  SpecialistRun,
+} from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -423,6 +427,126 @@ function WorkLine({ text }: { text: string }) {
       <Icon name="CornerDownRight" className="size-3.5" />
       <span className="font-medium">{name}</span> {label}
     </button>
+  );
+}
+
+// --- Specialists at work ---
+// One quiet line in a sage's header while specialists it handed work to run,
+// and for a short while after; nothing at all otherwise.
+
+/** How long a finished specialist stays on the line. */
+const LINGER_MS = 30_000;
+
+function duration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return seconds < 60
+    ? `${seconds}s`
+    : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** Running specialists and those finished within the linger window. */
+const recentRuns = (runs: SpecialistRun[], now: number) =>
+  runs.filter((run) => run.endedAt === null || now - run.endedAt < LINGER_MS);
+
+function runTitle(run: SpecialistRun, now: number): string {
+  const model = run.model ?? "default model";
+  return run.endedAt === null
+    ? `${model} · running ${duration(now - run.startedAt)}`
+    : `${model} · ${run.status === "failed" ? "failed after" : "took"} ${duration(run.endedAt - run.startedAt)}`;
+}
+
+function RunMark({ status }: { status: SpecialistRun["status"] }) {
+  if (status === "running") {
+    return (
+      <span
+        aria-label="running"
+        className="size-1.5 animate-pulse rounded-full bg-amber-500"
+      />
+    );
+  }
+  return status === "done" ? (
+    <span aria-label="done" className="text-emerald-500">✓</span>
+  ) : (
+    <span aria-label="failed" className="text-destructive">✕</span>
+  );
+}
+
+/**
+ * The specialists a sage is running, and for a lead, those its acolytes are
+ * running in sum. Sits in the header, so it never shifts the chat.
+ */
+function SpecialistsLine({
+  sage,
+  acolytes,
+}: {
+  sage: Sage;
+  /** A lead's open acolytes; none for an acolyte. */
+  acolytes: Sage[];
+}) {
+  const navigate = useBbNavigate();
+  const [now, setNow] = useState(Date.now);
+  const own = recentRuns(sage.specialists, now);
+  const nested = acolytes
+    .map((acolyte) => ({
+      acolyte,
+      runs: recentRuns(acolyte.specialists, now),
+    }))
+    .filter((each) => each.runs.length > 0);
+  const nestedCount = nested.reduce((sum, each) => sum + each.runs.length, 0);
+  const total = own.length + nestedCount;
+  // Ticks only while something shows: elapsed times and the linger window.
+  useEffect(() => {
+    if (total === 0) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [total]);
+  if (total === 0) return null;
+  const working = [...own, ...nested.flatMap((each) => each.runs)].some(
+    (run) => run.status === "running",
+  );
+  return (
+    <div
+      role="status"
+      className="flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap text-xs text-muted-foreground"
+    >
+      <Icon
+        name={working ? "Spinner" : "Check"}
+        className={`size-3 shrink-0 ${working ? "animate-spin" : ""}`}
+      />
+      <span className="shrink-0">
+        {total} {total === 1 ? "specialist" : "specialists"}
+      </span>
+      {own.map((run) => (
+        <span key={run.threadId} className="flex shrink-0 items-center gap-1">
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            title={runTitle(run, now)}
+            onClick={() => navigate.toThread(run.threadId)}
+            className="flex items-center gap-1 hover:text-foreground"
+          >
+            {run.name}
+            <RunMark status={run.status} />
+          </button>
+        </span>
+      ))}
+      {nested.length === 0 ? null : (
+        <span
+          className="truncate"
+          title={nested
+            .flatMap(({ acolyte, runs }) =>
+              runs.map(
+                (run) => `${acolyte.name}: ${run.name} · ${runTitle(run, now)}`,
+              ),
+            )
+            .join("\n")}
+        >
+          <span aria-hidden="true">· </span>
+          {own.length === 0 ? "" : `${nestedCount} `}across {nested.length}{" "}
+          {nested.length === 1 ? "acolyte" : "acolytes"}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -1278,8 +1402,14 @@ function SageChat({ sageId }: { sageId: string }) {
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
       <header className="flex shrink-0 items-center gap-2 border-b border-border py-2 pl-4 pr-3">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium">{sage.name}</div>
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <div className="min-w-0 shrink truncate text-sm font-medium">
+            {sage.name}
+          </div>
+          <SpecialistsLine
+            sage={sage}
+            acolytes={isAcolyte ? [] : openAcolytes}
+          />
         </div>
         {sage.stats.failing === null ? null : (
           <span
