@@ -7,6 +7,7 @@ import {
 } from "react";
 import {
   experimental_NewThreadComposer as NewThreadComposer,
+  experimental_Icon as Icon,
   Markdown,
   useBbNavigate,
   useRealtime,
@@ -20,6 +21,7 @@ import {
 import {
   envoyRpcContract,
   type Envoy,
+  type Lane,
   type Specialist,
 } from "./envoy-contract";
 import { Button } from "./components/ui/button";
@@ -106,7 +108,8 @@ function NewEnvoyDialog({
             "Task launch was rejected; adjust your selections and try again.",
         );
       onClose();
-      if (envoy.threadId) navigate.toThread(envoy.threadId);
+      if (envoy.chatId) navigate.toPluginPanel("sages", { subPath: envoy.chatId });
+      else if (envoy.threadId) navigate.toThread(envoy.threadId);
       else navigate.toPluginPanel("sages", { subPath: "envoys" });
     } catch (cause) {
       setError(errorText(cause));
@@ -126,8 +129,9 @@ function NewEnvoyDialog({
         <DialogHeader>
           <DialogTitle>New Envoy</DialogTitle>
           <DialogDescription>
-            A workspace and chat for one task. Specialists can help when
-            appropriate.
+            A chat that owns one task. It opens a lane for each part of the
+            work: a thread in a fresh worktree, with its own PR and
+            specialists.
           </DialogDescription>
         </DialogHeader>
         <label className="space-y-1 text-sm">
@@ -259,13 +263,16 @@ export function EnvoyList() {
       (filter === "all" ||
         (filter === "active"
           ? e.lifecycle === "active" || e.lifecycle === "creating"
-          : e.lifecycle === filter)),
+          : e.lifecycle === filter)) ||
+      (!!projectFilter && e.lanes.some((lane) => lane.projectId === projectFilter) &&
+        (filter === "all" || e.lifecycle === filter || (filter === "active" && e.lifecycle === "active"))),
   );
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4 p-4">
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm text-muted-foreground">
-          A workspace and chat for one task.
+          An Envoy owns one task from its chat, and does the work in lanes:
+          threads in fresh worktrees, one per repo or PR.
         </p>
         <Button onClick={() => openNewEnvoy(projectFilter || undefined)}>
           New Envoy
@@ -309,11 +316,16 @@ export function EnvoyList() {
             <div className="flex min-w-0 items-center gap-2">
               <button
                 type="button"
-                className="min-w-0 truncate text-left font-medium hover:underline"
-                disabled={!envoy.threadId}
-                onClick={() => navigate.toThread(envoy.threadId!)}
+                className="flex min-w-0 items-center gap-1.5 truncate text-left font-medium hover:underline"
+                disabled={!envoy.threadId && !envoy.chatId}
+                onClick={() =>
+                  envoy.chatId
+                    ? navigate.toPluginPanel("sages", { subPath: envoy.chatId })
+                    : navigate.toThread(envoy.threadId!)
+                }
               >
-                {envoy.name}
+                <Icon name="sages/envoy" className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="truncate">{envoy.name}</span>
               </button>
               {envoy.issue ? (
                 <UrlLink
@@ -328,11 +340,16 @@ export function EnvoyList() {
               </span>
             </div>
             <p className="text-xs text-muted-foreground">
-              {projects[envoy.projectId] ?? envoy.projectId}
+              {envoy.chatId
+                ? `${envoy.lanes.length} ${envoy.lanes.length === 1 ? "lane" : "lanes"}`
+                : projects[envoy.projectId] ?? envoy.projectId}
               {envoy.specialist ? ` · ${envoy.specialist}` : ""}
             </p>
+            {envoy.chatId && envoy.lanes.length ? (
+              <LaneList lanes={envoy.lanes} projects={projects} />
+            ) : null}
             <ErrorLine error={envoy.error} />
-            {!envoy.threadId && envoy.lifecycle !== "cancelled" ? (
+            {!envoy.threadId && !envoy.chatId && envoy.lifecycle !== "cancelled" ? (
               <div className="flex gap-3">
                 <Button
                   variant="ghost"
@@ -345,7 +362,9 @@ export function EnvoyList() {
                 >
                   {envoy.creation === "failed"
                     ? "Relaunch task"
-                    : "Recover task thread"}
+                    : envoy.kind === "chat"
+                      ? "Start its chat"
+                      : "Recover task thread"}
                 </Button>
                 <Button
                   variant="ghost"
@@ -374,32 +393,105 @@ export function EnvoyList() {
 }
 function EnvoyHeader({ threadId }: PluginThreadHeaderActionProps) {
   const rpc = useRpc<typeof envoyRpcContract>();
-  const [envoy, setEnvoy] = useState<Envoy | null>(null);
+  const [envoy, setEnvoy] = useState<(Envoy & { laneId: string | null }) | null>(null);
   const [open, setOpen] = useState(false);
   const refresh = useCallback(() => {
     rpc.call("envoys_get", { threadId }).then(setEnvoy, () => setEnvoy(null));
   }, [rpc, threadId]);
   useEffect(refresh, [refresh]);
   useRealtime("envoys-changed", refresh);
-  return envoy ? (
-    <div className="flex items-center gap-2">
-      {envoy.issue ? (
-        <UrlLink href={envoy.issue.url} className="text-xs">
-          {envoy.issue.key}
-        </UrlLink>
-      ) : null}
+  if (!envoy) return null;
+  return (
+    <>
       <Button
         variant="ghost"
         className="h-7 px-2 text-xs"
         onClick={() => setOpen(true)}
       >
-        Envoy · {envoy.lifecycle}
+        Envoy
       </Button>
       {open ? (
         <EnvoyDetails envoy={envoy} onClose={() => setOpen(false)} />
       ) : null}
+    </>
+  );
+}
+/** An Envoy's lanes: each a thread, with its project, state and PRs. */
+function LaneList({
+  lanes,
+  projects,
+}: {
+  lanes: readonly Lane[];
+  projects: Record<string, string>;
+}) {
+  const navigate = useBbNavigate();
+  return (
+    <ul className="ml-1 space-y-0.5 border-l border-border pl-3">
+      {lanes.map((lane) => (
+        <li className="flex min-w-0 items-center gap-2 text-xs" key={lane.id}>
+          <span className="shrink-0 rounded border border-border px-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+            Lane
+          </span>
+          <button
+            type="button"
+            className="min-w-0 truncate text-left hover:underline disabled:no-underline"
+            disabled={!lane.threadId}
+            onClick={() => navigate.toThread(lane.threadId!)}
+          >
+            {lane.name}
+          </button>
+          <span className="shrink-0 text-muted-foreground">
+            {projects[lane.projectId] ?? lane.projectId}
+          </span>
+          {lane.prs.map((pr) => (
+            <UrlLink className="shrink-0 text-muted-foreground" href={pr.url} key={pr.url}>
+              #{pr.number}
+            </UrlLink>
+          ))}
+          {lane.creation === "ready" ? null : (
+            <span className="shrink-0 text-destructive" title={lane.error ?? undefined}>
+              {lane.creation}
+            </span>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+/** The bar under an Envoy's chat header: its state, lanes and details. */
+export function EnvoyChatBar({ envoyId }: { envoyId: string }) {
+  const { envoys } = useEnvoys();
+  const sdk = useSdk();
+  const [projects, setProjects] = useState<Record<string, string>>({});
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    sdk.projects.list().then(
+      (list) => setProjects(Object.fromEntries(list.map((p) => [p.id, p.name]))),
+      () => {},
+    );
+  }, [sdk]);
+  const envoy = envoys.find((each) => each.id === envoyId);
+  if (!envoy) return null;
+  return (
+    <div className="flex shrink-0 flex-col gap-1.5 border-b border-border px-4 py-2">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className={`rounded-full px-2 py-0.5 font-medium capitalize ${LIFECYCLE_STYLE[envoy.lifecycle]}`}>
+          {envoy.lifecycle}
+        </span>
+        {envoy.issue ? <UrlLink href={envoy.issue.url}>{envoy.issue.key}</UrlLink> : null}
+        <span className="text-muted-foreground">
+          {envoy.lanes.length
+            ? `${envoy.lanes.length} ${envoy.lanes.length === 1 ? "lane" : "lanes"}`
+            : "No lanes yet"}
+        </span>
+        <Button variant="ghost" className="ml-auto h-6 px-2 text-xs" onClick={() => setOpen(true)}>
+          Details
+        </Button>
+      </div>
+      {envoy.lanes.length ? <LaneList lanes={envoy.lanes} projects={projects} /> : null}
+      {open ? <EnvoyDetails envoy={envoy} onClose={() => setOpen(false)} /> : null}
     </div>
-  ) : null;
+  );
 }
 const LIFECYCLE_STYLE: Record<Envoy["lifecycle"], string> = {
   creating: "bg-muted text-muted-foreground",
@@ -420,7 +512,7 @@ const ACTIONS = {
   },
   completed: {
     label: "Mark completed",
-    hint: "Save its final output and archive its thread, with its child threads, PR watchers and worktree. Resume brings it back.",
+    hint: "Save its final output and archive its threads (lanes), with their child threads, PR watchers and worktrees. Resume brings it back.",
   },
   cancelled: {
     label: "Cancel task",
@@ -464,6 +556,7 @@ function EnvoyDetails({
 }) {
   const rpc = useRpc<typeof envoyRpcContract>();
   const sdk = useSdk();
+  const navigate = useBbNavigate();
   const [overview, setOverview] = useState<Overview>({});
   useEffect(() => {
     let stale = false;
@@ -534,11 +627,13 @@ function EnvoyDetails({
     name.trim() !== envoy.name || issue.trim() !== (envoy.issue?.url ?? "");
   const setLifecycle = (lifecycle: keyof typeof ACTIONS) =>
     void run(() => rpc.call("envoys_lifecycle", { id: envoy.id, lifecycle }));
-  const rows: [string, string | undefined, string?][] = [
-    ["Project", overview.project],
-    ["Agent", overview.agent],
-    ["Workspace", overview.workspace, overview.path],
-  ];
+  const rows: [string, string | undefined, string?][] = envoy.chatId
+    ? [["Default project", overview.project]]
+    : [
+        ["Project", overview.project],
+        ["Agent", overview.agent],
+        ["Workspace", overview.workspace, overview.path],
+      ];
   return (
     <Dialog
       open
@@ -559,7 +654,11 @@ function EnvoyDetails({
               >
                 {envoy.lifecycle}
               </span>
-              <span>Led by {envoy.specialist ?? "a BB agent"}</span>
+              <span>
+                {envoy.chatId
+                  ? `Lanes led by ${envoy.specialist ?? "a BB agent"}`
+                  : `Led by ${envoy.specialist ?? "a BB agent"}`}
+              </span>
               {envoy.issue ? (
                 <>
                   <span aria-hidden="true">·</span>
@@ -589,6 +688,29 @@ function EnvoyDetails({
               <Markdown content={envoy.directive} />
             </div>
           </Section>
+
+          {envoy.chatId ? (
+            <Section title="Lanes">
+              <Button
+                className="mb-2"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  onClose();
+                  navigate.toPluginPanel("sages", { subPath: envoy.chatId! });
+                }}
+              >
+                Open chat
+              </Button>
+              {envoy.lanes.length ? (
+                <LaneList lanes={envoy.lanes} projects={{}} />
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  None yet. The Envoy opens one for each part of the work.
+                </p>
+              )}
+            </Section>
+          ) : null}
 
           <Section title="Pull requests">
             {envoy.prs.length ? (

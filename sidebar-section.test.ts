@@ -178,3 +178,57 @@ test("Envoy activity publishes at once, then at most once per throttle window", 
   assert.ok(b >= a);
   assert.equal(refreshes(), 2);
 });
+
+test("an Envoy with a chat heads its lanes; each lane gets its own workspace badges", async () => {
+  const chat = envoySchema.parse({
+    ...envoy("d", null),
+    environmentId: null,
+    chatId: "chat-d",
+    lanes: [
+      { id: "l1", name: "wallet: UI", projectId: "project-1", threadId: "lane-1", environmentId: "env-l1", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
+      { id: "l2", name: "backend: API", projectId: "project-2", threadId: "lane-2", environmentId: "env-l2", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
+    ],
+  });
+  const asked: any[] = [];
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "sages",
+    sdk: {
+      threads: { get: async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId }) },
+      plugins: {
+        experimental_discoverRpc: async ({ method }: { method: string }) =>
+          [{ pluginId: "metro", method, displayName: "Metro" }],
+        callRpc: async (args: any) => {
+          if (args.pluginId === "sidebar-thread-details") return { ok: true };
+          asked.push(...args.input.envoys);
+          return { decorations: [{ envoyId: "d:l1", badges: [{ label: "Metro 8081" }] }] };
+        },
+      },
+    } as any,
+  });
+  registerSidebarSection(bb, {
+    sages: () => [],
+    reorderSages: async (ids) => ids,
+    envoys: () => [envoy("a", "thread-a"), chat],
+    hiddenBadges: () => [],
+  });
+  const { sections } = (await harness.behavior.callRpc("sidebar-section.v1.get", {
+    threadIds: ["thread-a", "lane-1"],
+  })) as any;
+  const envoys = sections.find((each: any) => each.id === "envoys");
+  // The older Envoy is still its thread; the chat Envoy is a group.
+  assert.deepEqual(envoys.threads.map((t: any) => t.threadId), ["thread-a"]);
+  assert.equal(envoys.groups.length, 1);
+  const group = envoys.groups[0];
+  assert.equal(group.label, "d");
+  assert.equal(group.path, "/plugins/sages/sages/chat-d");
+  assert.equal(group.kind, "Envoy");
+  assert.equal(group.threadKind, "Lane");
+  assert.equal(group.icon, null);
+  assert.deepEqual(group.badges.map((b: any) => b.label), ["[WAL-1]"]);
+  // Only lanes in the sidebar are listed, each with its own badges.
+  assert.deepEqual(group.threads, [
+    { threadId: "lane-1", activityAt: null, badges: [{ label: "Metro 8081", tone: "neutral", placement: "meta", href: null, title: null }] },
+  ]);
+  // Decorators see each lane as a workspace of its own.
+  assert.deepEqual(asked.map((each) => each.id), ["a", "d:l1", "d:l2"]);
+});

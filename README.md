@@ -8,9 +8,12 @@ A BB plugin with three parts:
   project. Its chat never ends and never needs compacting.
 - An **acolyte** is a sage under a lead sage. It focuses on one part of the
   lead's work and shares the lead's memory.
-- An **Envoy** is one bounded task, such as a bug, an issue or a small feature.
-  It gets its own workspace, one visible BB thread, and a clear lifecycle from
-  start to done.
+- An **Envoy** is one bounded task, such as a bug, an issue or a feature. It
+  gets its own endless chat, which coordinates the work, and a clear lifecycle
+  from start to done.
+- A **lane** is one part of an Envoy's work: a visible BB thread in its own
+  fresh worktree, usually one per repo or PR. It owns its PRs, and the
+  specialists it hands work to run as its **child threads**.
 
 ## Table of Contents
 
@@ -38,8 +41,9 @@ brief, and the sage can open any line back up to the original message. The
 context stays the same size however long the chat runs.
 
 Sages are good for lasting conversations, but not for doing scoped work in a
-repository. Envoys fill that gap. They give each task its own worktree and
-thread, track its PRs, and let you park or close it cleanly.
+repository. Envoys fill that gap. Each task gets a chat that opens a worktree
+and thread (a lane) for each part of the work, tracks their PRs, and lets you
+park or close it all cleanly.
 
 The memory design comes from Victor Taelin's
 [optchat](https://gist.githubusercontent.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449/raw/3c190e06f34aba0c69f49042c526093269604935/optchat.md).
@@ -130,23 +134,42 @@ knows. Acolytes cannot have acolytes.
 Start one from **Sages → Envoys → New Envoy**, from the **New Envoy** command
 palette action, from the CLI, or by asking a sage. Describe the task. You can
 also give a name, an issue link and a specialist lead. BB's composer picks the
-machine, base branch, model and permissions. Git projects start in a fresh
-worktree.
+default project, model and permissions.
 
-**Working.** By default an ordinary BB agent leads, and it hands work to
-specialists when their role fits. The Envoy opens PRs as drafts and attaches
-them with `envoy_attach_pr` (or you attach them in the details dialog). The
-Envoy owns each PR to the end.
+**Three levels.** In the sidebar's Envoys section:
+
+```
+✈ Takes share cards            ← the Envoy: opens its chat
+│ [LANE] wallet: share card     ← a lane: a thread in its own worktree
+│   └ device-validator run      ← a child thread the lane started
+│ [LANE] backend: take kind
+```
+
+**The chat.** The Envoy's chat works like a sage's: it never ends, and each
+message runs as a fresh turn that reads a summary of the whole chat. It does
+not edit code. It opens lanes with `envoy_open_lane(project, name, task)`, one
+per repo or per PR you want reviewed apart, and as many as the work turns out
+to need. It messages a lane with `envoy_message_lane`. When a turn it started
+in a lane ends, the lane's last message comes back to the chat as a new turn.
+If you work in a lane directly, that turn only shows up in the chat's log.
+
+**Lanes.** By default an ordinary BB agent leads each lane (or the specialist
+lead, if you picked one), and it hands work to specialists when their role
+fits. A lane opens PRs as drafts and attaches them with `envoy_attach_pr` (or
+you attach them in the details dialog). The lane owns each PR to the end.
+
+Envoys started before lanes existed are one thread each and keep working as
+before.
 
 **Ready-PR handoff.** If you pick a handoff specialist in the settings, each
-attached PR gets a watcher. A watcher is a script automation the Envoy owns,
+attached PR gets a watcher. A watcher is a script automation the lane owns,
 named `Envoy PR watcher: <url>`. Every 2 minutes it checks the PR with `gh`.
-Once the PR is marked ready, it tells the Envoy, which hands the PR to the
+Once the PR is marked ready, it tells the lane, which hands the PR to the
 specialist and then deletes the watcher. A closed or merged PR also deletes
 its watcher.
 
 **Reporting to a sage.** An Envoy that a sage started gets an `envoy_report`
-tool. It reports to that sage only when it is blocked or needs a decision
+tool in its chat. The sage answers with `bb sages envoy tell <id> "<message>"`. It reports to that sage only when it is blocked or needs a decision
 while you aren't in the conversation. A failed turn is reported the same way.
 Routine progress is never reported.
 
@@ -154,10 +177,10 @@ Routine progress is never reported.
 
 | Action | What happens |
 | --- | --- |
-| **Park** | Stops the Envoy's working threads and removes its watchers. The chat, the worktree and the handoff worker stay. |
-| **Resume** | Sends the Envoy back to its task and restores its watchers. If the Envoy was completed, its thread is unarchived and its worktree rebuilt first. |
-| **Complete** | Saves the final output, then archives the thread with its children and retires the worktree. The chat stays readable. |
-| **Cancel** | Stops every thread under the Envoy and removes its watchers. Only Resume brings it back. |
+| **Park** | Stops the chat's turn and each lane with its children, and removes its watchers. The chat, the worktrees and the handoff workers stay. |
+| **Resume** | Restores its watchers and tells the chat to carry on. If the Envoy was completed, its lanes are unarchived and their worktrees rebuilt first. |
+| **Complete** | Saves the chat's last reply, then archives each lane with its children and retires the worktrees. The chat stays readable. |
+| **Cancel** | Stops the chat and every thread under each lane, and removes its watchers. Only Resume brings it back. |
 
 Automated messages cannot wake a parked, completed or cancelled Envoy. A
 message from you resumes a parked or completed one.
@@ -273,6 +296,10 @@ row adds nothing. When its data changes, a source calls this plugin's
 { envoy: { id; threadId: string | null; projectId; environmentId: string | null; lifecycle } }
 ```
 
+For an Envoy with lanes, each lane is its own workspace: decorators and
+listeners get one entry per lane, with the id `<envoy id>:<lane id>` and the
+lane's thread and environment, and badges for that id go on the lane's row.
+
 This is called on each park, resume, complete and cancel. A completed Envoy
 is announced before its thread is archived, so its environment can still be
 read. A listener gets 3 seconds, so it should do slow work in the background.
@@ -309,7 +336,7 @@ Where things live:
 | `prompts.ts` | The turn and compaction prompts. |
 | `server.ts` | Sages and acolytes: records, turns, tools, settings, RPC and the `bb sages` CLI. |
 | `harness.ts` | Calling the summary model through provider CLIs. |
-| `envoys.ts`, `envoy-contract.ts` | Envoys: creation, lifecycle, PR watchers, reports and their RPC. |
+| `envoys.ts`, `envoy-contract.ts` | Envoys: creation, lanes, lifecycle, PR watchers, reports and their RPC. The Envoy's chat runs on the sage chat in `server.ts`. |
 | `source-preparation.ts`, `host.ts` | Preparing a project's base checkout on its machine. |
 | `sidebar-section.ts` | The sidebar sections and Envoy badges. |
 | `mentions.ts` | `@` mentions of sages. |

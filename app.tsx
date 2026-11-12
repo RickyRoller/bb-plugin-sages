@@ -37,7 +37,7 @@ import type {
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
-import { EnvoyList, registerEnvoyApp } from "./envoys-app";
+import { EnvoyChatBar, EnvoyList, registerEnvoyApp } from "./envoys-app";
 import { registerSettingsApp } from "./settings-app";
 
 const PANEL_PATH = "sages";
@@ -241,7 +241,9 @@ function SummaryAlert({ sages }: { sages: Sage[] }) {
 }
 
 function SageList() {
-  const { rpc, sages, error, report } = useSages();
+  const { rpc, sages: all, error, report } = useSages();
+  // An Envoy's chat is listed with the Envoys.
+  const sages = all?.filter((sage) => sage.envoyId == null) ?? null;
   const projects = useProjects();
   const navigate = useBbNavigate();
   // Remounts the form to clear it after a create.
@@ -1260,11 +1262,13 @@ function SageChat({ sageId }: { sageId: string }) {
     sage?.parentId == null
       ? undefined
       : sages?.find((candidate) => candidate.id === sage.parentId);
-  // An acolyte's way back is its lead.
+  // An acolyte's way back is its lead; an Envoy's, the Envoys.
   const toList = () =>
-    sage?.parentId == null
-      ? navigate.toPluginPanel(PANEL_PATH)
-      : toSage(navigate, sage.parentId);
+    sage?.envoyId != null
+      ? navigate.toPluginPanel(PANEL_PATH, { subPath: "envoys" })
+      : sage?.parentId == null
+        ? navigate.toPluginPanel(PANEL_PATH)
+        : toSage(navigate, sage.parentId);
   const history = useHistory(sageId, sage?.stats.messages ?? 0);
   // The turn on screen, kept after it ends: swapping back to the logged chat
   // would reflow the page for nothing. A new turn replaces it once loaded.
@@ -1403,6 +1407,15 @@ function SageChat({ sageId }: { sageId: string }) {
     <div className="flex h-full min-h-0 flex-1 flex-col">
       <header className="flex shrink-0 items-center gap-2 border-b border-border py-2 pl-4 pr-3">
         <div className="flex min-w-0 flex-1 items-center gap-3">
+          {sage.envoyId != null ? (
+            <span
+              className="flex shrink-0 items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+              title="An Envoy: this chat owns one task and does the work in lanes, each a thread in its own worktree."
+            >
+              <Icon name="sages/envoy" className="size-3" />
+              Envoy
+            </span>
+          ) : null}
           <div className="min-w-0 shrink truncate text-sm font-medium">
             {sage.name}
           </div>
@@ -1441,6 +1454,7 @@ function SageChat({ sageId }: { sageId: string }) {
             Stop
           </Button>
         ) : null}
+        {sage.envoyId != null ? null : <>
         {isAcolyte && sage.archivedAt === null && !sage.closing ? (
           <Button
             variant="ghost"
@@ -1481,7 +1495,9 @@ function SageChat({ sageId }: { sageId: string }) {
         >
           <Icon name="Trash2" className="size-4" />
         </Button>
+        </>}
       </header>
+      {sage.envoyId != null ? <EnvoyChatBar envoyId={sage.envoyId} /> : null}
       {sage.stats.failing === null ? null : (
         <div className="px-4 pt-2">
           <SummaryAlert sages={[sage]} />
@@ -1509,7 +1525,10 @@ function SageChat({ sageId }: { sageId: string }) {
                 acolytes.size > 0
                   ? []
                   : sages.filter(
-                      (each) => each.parentId === null && each.id !== sage.id,
+                      (each) =>
+                        each.parentId === null &&
+                        each.envoyId == null &&
+                        each.id !== sage.id,
                     )
               }
               submitLabel="Save"

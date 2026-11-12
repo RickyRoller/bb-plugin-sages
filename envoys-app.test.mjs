@@ -55,6 +55,9 @@ const envoy = {
   issue: { key: "ABC-123", url: "https://tracker.example.com/issue/ABC-123" },
   specialist: null,
   prs: [],
+  chatId: null,
+  lanes: [],
+  laneId: null,
   result: null,
   createdAt: "2026-10-14",
   updatedAt: "2026-10-14",
@@ -194,8 +197,8 @@ test("chat header exposes task details and attaches a PR without making it ready
     },
   );
   try {
-    await waitFor(() => assert.ok(slot.queryByText("Envoy · active")));
-    fireEvent.click(slot.getByText("Envoy · active"));
+    await waitFor(() => assert.ok(slot.queryByText("Envoy")));
+    fireEvent.click(slot.getByText("Envoy"));
     await waitFor(() =>
       assert.ok(slot.queryByText("BB worktree · bb/fix-crash")),
     );
@@ -333,6 +336,49 @@ test("a rejected launch retains the creation dialog and draft so corrected resub
     assert.equal(requests.length, 2);
     assert.equal(requests[0].requestId, requests[1].requestId);
     assert.equal(document.querySelector('[role="dialog"]'), null);
+  } finally {
+    slot.lifecycle.unmount();
+  }
+});
+
+test("a lane's header is one Envoy button whose dialog opens the Envoy's chat", async () => {
+  const chatEnvoy = {
+    ...envoy,
+    threadId: null,
+    chatId: "chat-1",
+    laneId: "lane-1",
+    lanes: [
+      {
+        id: "lane-1",
+        name: "wallet: share card",
+        projectId: "project-1",
+        threadId: "thread-1",
+        environmentId: "environment-1",
+        creation: "ready",
+        error: null,
+        prs: [],
+        createdAt: "2026-10-14",
+      },
+    ],
+  };
+  const slot = renderSlot(
+    app.threadHeaderActions[0],
+    { threadId: "thread-1", projectId: "project-1", isCompactViewport: false },
+    { sdk, rpc: { envoys_get: () => chatEnvoy } },
+  );
+  try {
+    await waitFor(() => assert.ok(slot.queryByText("Envoy")));
+    assert.equal(slot.queryByText("Lane"), null);
+    fireEvent.click(slot.getByText("Envoy"));
+    await waitFor(() => assert.ok(slot.queryByText("Open chat")));
+    fireEvent.click(slot.getByText("Open chat"));
+    await waitFor(() =>
+      assert.deepEqual(slot.inspection.navigateCalls.at(-1), {
+        method: "toPluginPanel",
+        path: "sages",
+        options: { subPath: "chat-1" },
+      }),
+    );
   } finally {
     slot.lifecycle.unmount();
   }

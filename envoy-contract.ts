@@ -73,6 +73,23 @@ export const prSchema = z.object({
   repo: z.string(),
   number: z.number().int().positive(),
 });
+/**
+ * A lane: one visible thread in its own fresh worktree, opened by an Envoy's
+ * chat for one part of its task (usually one repo or one PR). It owns its
+ * PRs, their watchers and its specialist child threads.
+ */
+export const laneSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  projectId: z.string(),
+  threadId: z.string().nullable(),
+  environmentId: z.string().nullable(),
+  creation: z.enum(["launching", "ready", "failed", "uncertain"]),
+  error: z.string().nullable(),
+  prs: z.array(prSchema).default([]),
+  createdAt: z.string(),
+});
+export type Lane = z.infer<typeof laneSchema>;
 export const envoySchema = z.object({
   id: z.string(),
   requestId: z.string(),
@@ -93,6 +110,14 @@ export const envoySchema = z.object({
     .nullable()
     .default(null),
   prs: z.array(prSchema),
+  /**
+   * The Envoy's own chat (a sage record) when it coordinates lanes; null for
+   * an older Envoy that is one thread (threadId) itself.
+   */
+  chatId: z.string().nullable().default(null),
+  /** "chat" for an Envoy that coordinates lanes from its chat; "thread" for an older one. */
+  kind: z.enum(["chat", "thread"]).default("thread"),
+  lanes: z.array(laneSchema).default([]),
   result: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -158,9 +183,10 @@ export const envoyRpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ envoys: z.array(envoySchema) }),
   },
+  /** The Envoy a thread is, or is a lane of; laneId names the lane. */
   envoys_get: {
     input: z.object({ threadId: z.string() }),
-    output: envoySchema.nullable(),
+    output: envoySchema.extend({ laneId: z.string().nullable() }).nullable(),
   },
   envoys_create: { input: createSchema, output: envoySchema },
   envoys_retry: { input: z.object({ id: z.string() }), output: envoySchema },

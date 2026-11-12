@@ -10,6 +10,7 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { lifecycleSchema, type Envoy } from "./envoy-contract.ts";
+import { workspaces } from "./envoys.ts";
 
 export const DECORATION_METHOD = "envoy-decorations.v1.get";
 /** The built-in badge source, beside the plugin ids of decorators. */
@@ -58,6 +59,26 @@ export const sidebarSectionContract = defineRpcContract({
               threadId: z.string(),
               badges: z.array(badgeSchema),
               activityAt: z.number().nullable(),
+            }),
+          ),
+          /**
+           * A row heading the threads it groups (an Envoy over its lanes);
+           * each thread keeps its own child threads under it.
+           */
+          groups: z.array(
+            z.object({
+              ...linkBase,
+              kind: z.string(),
+              threadKind: z.string(),
+              badges: z.array(badgeSchema),
+              activityAt: z.number().nullable(),
+              threads: z.array(
+                z.object({
+                  threadId: z.string(),
+                  badges: z.array(badgeSchema),
+                  activityAt: z.number().nullable(),
+                }),
+              ),
             }),
           ),
         }),
@@ -149,7 +170,9 @@ export function registerSidebarSection(
     parentThreadId?: string | null,
     depth = 0,
   ): Promise<string | null> {
-    const direct = [...deps.envoys()].find((e) => e.threadId === threadId);
+    const direct = [...deps.envoys()].find(
+      (e) => e.threadId === threadId || e.lanes.some((lane) => lane.threadId === threadId),
+    );
     if (direct) return direct.id;
     if (owners.has(threadId)) return owners.get(threadId)!;
     if (depth > 20) return null;
@@ -201,17 +224,8 @@ export function registerSidebarSection(
     const sources = (await decorators()).filter(({ id }) => !hidden.has(id));
     const byEnvoy = new Map<string, Badge[]>();
     if (!envoys.length) return byEnvoy;
-    const input = {
-      envoys: envoys.map(
-        ({ id, threadId, projectId, environmentId, lifecycle }) => ({
-          id,
-          threadId,
-          projectId,
-          environmentId,
-          lifecycle,
-        }),
-      ),
-    };
+    // Each lane is a workspace of its own, decorated apart from the others.
+    const input = { envoys: envoys.flatMap(workspaces) };
     const answers = await Promise.all(
       sources.map(({ id: pluginId }) =>
         bb.sdk.plugins
@@ -247,11 +261,32 @@ export function registerSidebarSection(
     {
       "sidebar-section.v1.get": async ({ threadIds }) => {
         const ids = new Set(threadIds);
-        const envoys = [...deps.envoys()].filter(
-          (each) => each.threadId && ids.has(each.threadId),
+        const all = [...deps.envoys()];
+        // Older Envoys are their thread; an Envoy with a chat heads its lanes
+        // while it is open, or while any lane is still in the sidebar.
+        const envoys = all.filter(
+          (each) => !each.chatId && each.threadId && ids.has(each.threadId),
         );
+        const chats = all
+          .filter(
+            (each) =>
+              each.chatId &&
+              (["creating", "active", "parked"].includes(each.lifecycle) ||
+                each.lanes.some((lane) => lane.threadId && ids.has(lane.threadId))),
+          )
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         const showIssue = !deps.hiddenBadges().includes(ISSUE_SOURCE);
-        const extra = await decorate(envoys);
+        const extra = await decorate([...envoys, ...chats]);
+        const issueBadge = (envoy: Envoy) =>
+          showIssue && envoy.issue
+            ? [
+                badgeSchema.parse({
+                  label: `[${envoy.issue.key}]`.slice(0, 40),
+                  href: envoy.issue.url,
+                  title: envoy.issue.url,
+                }),
+              ]
+            : [];
         const sages = deps.sages();
         const link = (sage: ListedSage, icon: string) => ({
           id: sage.id,
@@ -267,6 +302,7 @@ export function registerSidebarSection(
               order: 0,
               reorderable: true,
               threads: [],
+              groups: [],
               links: sages
                 .filter((sage) => sage.parentId == null)
                 .map((sage) => ({
@@ -286,21 +322,32 @@ export function registerSidebarSection(
               order: 1,
               reorderable: false,
               links: [],
+              groups: chats.map((envoy) => ({
+                id: envoy.id,
+                label: envoy.name,
+                path: `/plugins/sages/sages/${envoy.chatId}`,
+                icon: null,
+                kind: "Envoy",
+                threadKind: "Lane",
+                activityAt: activity.get(envoy.id) ?? null,
+                badges: [
+                  ...issueBadge(envoy),
+                  ...(envoy.lifecycle === "active" || envoy.lifecycle === "creating"
+                    ? []
+                    : [badgeSchema.parse({ label: envoy.lifecycle, tone: envoy.lifecycle === "parked" ? "warning" : "neutral", placement: "title" })]),
+                ],
+                threads: envoy.lanes
+                  .filter((lane) => lane.threadId && ids.has(lane.threadId))
+                  .map((lane) => ({
+                    threadId: lane.threadId!,
+                    activityAt: null,
+                    badges: extra.get(`${envoy.id}:${lane.id}`) ?? [],
+                  })),
+              })),
               threads: envoys.map((envoy) => ({
                 threadId: envoy.threadId!,
                 activityAt: activity.get(envoy.id) ?? null,
-                badges: [
-                  ...(showIssue && envoy.issue
-                    ? [
-                        badgeSchema.parse({
-                          label: `[${envoy.issue.key}]`.slice(0, 40),
-                          href: envoy.issue.url,
-                          title: envoy.issue.url,
-                        }),
-                      ]
-                    : []),
-                  ...(extra.get(envoy.id) ?? []),
-                ],
+                badges: [...issueBadge(envoy), ...(extra.get(envoy.id) ?? [])],
               })),
             },
           ],

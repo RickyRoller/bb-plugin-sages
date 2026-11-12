@@ -13,7 +13,8 @@
     "branding": {
       "icon": "./icons/sage.svg",
       "experimental_icons": {
-        "sage": "./icons/sage.svg"
+        "sage": "./icons/sage.svg",
+        "envoy": "./icons/envoy.svg"
       }
     },
     "server": "./server.ts",

@@ -12,7 +12,15 @@ import { resolve } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { Chat, MIGRATIONS, type Kind, type Summarize } from "./optchat";
-import { ENVOY_USAGE, registerEnvoys, type EnvoyConfig } from "./envoys.ts";
+import {
+  ENVOY_USAGE,
+  LANE_MESSAGE_TOOL,
+  LANE_TOOL,
+  REPORT_TOOL,
+  registerEnvoys,
+  type EnvoyChat,
+  type EnvoyConfig,
+} from "./envoys.ts";
 import type { Envoy } from "./envoy-contract.ts";
 import { nudgeSidebar, registerSidebarSection } from "./sidebar-section.ts";
 import { mentionContext, mentionItems } from "./mentions.ts";
@@ -52,6 +60,11 @@ const sageSchema = z.object({
    * acolyte's topic is its focus within the lead's work.
    */
   parentId: z.string().nullable().default(null),
+  /**
+   * For an Envoy's chat: the Envoy. Such a sage is listed with the Envoys,
+   * not the sages, and coordinates the Envoy's lanes.
+   */
+  envoyId: z.string().nullable().default(null),
   /** When the acolyte was closed; it is kept, read-only, until reopened. */
   archivedAt: z.string().nullable().default(null),
   /** Whether the acolyte's closing summary is being written. */
@@ -434,7 +447,45 @@ export default async function plugin(bb: BbPluginApi) {
       },
       model: preferences.envoyModel,
     };
-  }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text));
+  }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text), {
+    open: (envoy, launch) => openEnvoyChat(envoy, launch),
+    deliver: (chatId, notice, report, start) => {
+      serial(chatId, async () => {
+        if (!start) {
+          chatOf(chatId).append("work", report);
+          publish();
+          return;
+        }
+        try {
+          await deliver(chatId, null, notice, report);
+        } catch (cause) {
+          // Undelivered, it still joins the chat for the next turn.
+          chatOf(chatId).append("work", report);
+          throw cause;
+        }
+      }).catch((cause) =>
+        bb.log.warn(`could not bring a message to an Envoy's chat: ${errorText(cause)}`),
+      );
+    },
+    stop: async (chatId) => {
+      const sage = sages.find((each) => each.id === chatId);
+      if (sage?.running && sage.threadId !== null)
+        await bb.sdk.threads.stop({ threadId: sage.threadId });
+    },
+    lastReply: (chatId) =>
+      chatOf(chatId)
+        .history(null, 200)
+        .reverse()
+        .find((message) => message.kind === "sage")?.text ?? null,
+    envoyOfTurn: async (threadId) => (await sageOfTurn(threadId)).envoyId,
+    userTurn: (threadId) => userTurnThreads.has(threadId),
+    rename: (chatId, name) => {
+      if (sages.some((each) => each.id === chatId))
+        updateSage(chatId, { name }).catch(() => {});
+    },
+  } satisfies EnvoyChat);
+  /** Turn threads the user started or joined, so an Envoy's chat knows not to report to its sage. */
+  const userTurnThreads = new Set<string>();
 
   // bb.agents.configure is synchronous, so sages are served from memory and
   // written through to storage.
@@ -513,6 +564,79 @@ export default async function plugin(bb: BbPluginApi) {
     });
     await writeSages([...sages, sage]);
     return sage;
+  }
+
+  /**
+   * An Envoy's chat: a sage record listed with the Envoys. Its turns run in
+   * the personal workspace, on the composer's explicit model, else the Envoy
+   * model setting, else its sage's; the first one works on the directive.
+   */
+  async function openEnvoyChat(
+    envoy: Envoy,
+    launch: { request: { input: readonly unknown[] }; lead: unknown },
+  ): Promise<string> {
+    const existing = sages.find((each) => each.envoyId === envoy.id);
+    if (existing) return existing.id;
+    const projects = await bb.sdk.projects.list({ includePersonal: true });
+    const personal = projects.find((each) => each.kind === "personal");
+    if (personal === undefined) throw new Error("bb has no personal project for the Envoy's chat");
+    const request = launch.request as unknown as Record<string, unknown>;
+    const sources = (request.executionInputSources ?? {}) as Record<string, string>;
+    const pick = (from: Record<string, unknown> | null | undefined) =>
+      from && typeof from.providerId === "string" && typeof from.model === "string"
+        ? {
+            providerId: from.providerId,
+            model: from.model,
+            reasoningLevel: typeof from.reasoningLevel === "string" ? from.reasoningLevel : "medium",
+            ...(typeof from.serviceTier === "string" ? { serviceTier: from.serviceTier } : {}),
+          }
+        : null;
+    const lead = sages.find((each) => each.id === envoy.reportTo?.sageId);
+    const model =
+      (sources.model === "explicit" ? pick(request) : null) ??
+      preferences.envoyModel ??
+      pick(request) ??
+      pick(lead?.defaults) ??
+      pick(sages.find((each) => pick(each.defaults) !== null)?.defaults);
+    const now = new Date().toISOString();
+    const sage = sageSchema.parse({
+      id: randomUUID().slice(0, 8),
+      name: envoy.name,
+      topic: "Envoy",
+      instructions: "",
+      envoyId: envoy.id,
+      defaults: {
+        projectId: personal.id,
+        environment: { type: "host", workspace: { type: "personal" } },
+        ...(model ?? {}),
+        permissionMode: "full",
+        executionInputSources: {
+          ...(model ? { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" } : {}),
+          permissionMode: "explicit",
+        },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await writeSages([...sages, sage]);
+    const input = [
+      ...(envoy.issue
+        ? [{ type: "text", text: `Linked issue: ${envoy.issue.key}\n${envoy.issue.url}`, mentions: [] }]
+        : []),
+      ...(launch.request.input as readonly Record<string, unknown>[]),
+    ];
+    serial(sage.id, () =>
+      send(
+        sage.id,
+        turnRequestSchema.parse({ ...sage.defaults, input }),
+        envoy.reportTo
+          ? { kind: "work", log: `[sage ${envoy.reportTo.name}] task:\n${envoy.directive}` }
+          : undefined,
+      ),
+    ).catch((cause) =>
+      updateSage(sage.id, { error: `The first turn did not start: ${errorText(cause)}` }).catch(() => {}),
+    );
+    return sage.id;
   }
 
   // --- Compaction calls: a hidden bb thread on the chosen model. ---
@@ -875,8 +999,9 @@ export default async function plugin(bb: BbPluginApi) {
    * the world, which is read now so every turn sees it as it is.
    */
   async function turnContext(sage: Sage, view: string): Promise<string[]> {
-    const specialists = specialistsText(await listSpecialists());
     const date = `Date: ${new Date().toString()}`;
+    if (sage.envoyId !== null) return [view, [date, ...(await envoyState(sage.envoyId))].join("\n\n")];
+    const specialists = specialistsText(await listSpecialists());
     if (sage.parentId === null) {
       const open = sages.filter(
         (acolyte) =>
@@ -926,6 +1051,36 @@ export default async function plugin(bb: BbPluginApi) {
       mainView(chatOf(parent.id).render()),
       view,
       [date, acolyte, specialists].join("\n\n"),
+    ];
+  }
+
+  /** What an Envoy's chat sees after its view: the Envoy, its lanes as they are now, the projects and specialists. */
+  async function envoyState(envoyId: string): Promise<string[]> {
+    const envoy = envoys.get(envoyId);
+    if (envoy === null) return ["This Envoy no longer exists."];
+    const [projects, known] = await Promise.all([
+      bb.sdk.projects.list({ includePersonal: false }).catch(() => []),
+      listSpecialists(),
+    ]);
+    const projectName = (id: string) =>
+      projects.find((each) => each.id === id)?.name ?? id;
+    const lanes = await Promise.all(
+      envoy.lanes.map(async (lane) => {
+        const status = lane.threadId
+          ? await bb.sdk.threads
+              .get({ threadId: lane.threadId })
+              .then((thread) => (thread.archivedAt ? "archived" : thread.status), () => "unknown")
+          : lane.creation;
+        return `- "${lane.name}" (lane ${lane.id}, ${projectName(lane.projectId)}${lane.threadId ? `, @thread:${lane.threadId}` : ""}, ${status})${lane.error ? ` error: ${lane.error}` : ""}${lane.prs.length ? `; PRs: ${lane.prs.map((pr) => pr.url).join(", ")}` : ""}`;
+      }),
+    );
+    return [
+      `Envoy "${envoy.name}" (${envoy.id}): ${envoy.lifecycle}${envoy.issue ? `; issue ${envoy.issue.key} ${envoy.issue.url}` : ""}; default project ${projectName(envoy.projectId)}${envoy.specialist ? `; its lanes are led by the ${envoy.specialist} specialist` : ""}.`,
+      lanes.length ? ["Your lanes:", ...lanes].join("\n") : "Your lanes: none yet.",
+      `Projects for lanes: ${projects.map((each) => `${each.name} (${each.id})`).join(", ") || "none listed"}`,
+      known === null
+        ? "Specialists: unavailable right now."
+        : `Specialists your lanes can hand work to: ${known.map((each) => `${each.name} (${each.description || "no description"})`).join("; ") || "none"}`,
     ];
   }
 
@@ -1402,12 +1557,14 @@ export default async function plugin(bb: BbPluginApi) {
       sage.archivedAt !== null && sage.parentId !== null
         ? findSage(sage.parentId)
         : sage;
-    const report = `[Envoy ${envoy.name}] ${outcome} (thread ${envoy.threadId}):\n${text}`;
+    const report = envoy.chatId
+      ? `[Envoy ${envoy.name}] ${outcome} (Envoy ${envoy.id}; answer with bb sages envoy tell ${envoy.id} "<message>"):\n${text}`
+      : `[Envoy ${envoy.name}] ${outcome} (thread ${envoy.threadId}):\n${text}`;
     serial(target.id, async () => {
       try {
         await deliver(
           target.id,
-          envoy.threadId,
+          envoy.chatId ? null : envoy.threadId,
           `Envoy ${envoy.name} ${outcome}`,
           report,
         );
@@ -1509,7 +1666,8 @@ export default async function plugin(bb: BbPluginApi) {
   bb.ui.registerMentionProvider({
     id: "sage",
     label: "Sages",
-    search: ({ query }) => mentionItems(sages, query),
+    search: ({ query }) =>
+      mentionItems(sages.filter((each) => each.envoyId === null), query),
     // Runs at send time; a throw blocks the send with this message.
     resolve(itemId) {
       const sage = findSage(itemId);
@@ -1519,7 +1677,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   registerSidebarSection(bb, {
-    sages: () => sages,
+    sages: () => sages.filter((each) => each.envoyId === null),
     reorderSages,
     envoys: () => envoys.list(),
     hiddenBadges: () => preferences.hiddenEnvoyBadges,
@@ -1559,7 +1717,20 @@ export default async function plugin(bb: BbPluginApi) {
           requests.delete(requests.values().next().value!);
         }
       }
-      const sent = serial(id, () => send(id, request)).then(
+      const target = findSage(id);
+      if (target.envoyId !== null) {
+        const envoy = envoys.get(target.envoyId);
+        if (envoy?.lifecycle === "cancelled")
+          throw new Error("This Envoy is cancelled");
+        // The user's message resumes a parked or completed Envoy.
+        if (envoy && envoy.lifecycle !== "active")
+          await envoys.lifecycle(envoy.id, "active", true);
+      }
+      const sent = serial(id, async () => {
+        const sage = await send(id, request);
+        if (sage.threadId !== null) userTurnThreads.add(sage.threadId);
+        return sage;
+      }).then(
         () => true,
         async (cause: unknown) => {
           // Failed, it was never sent: the client may send it again.
@@ -1859,7 +2030,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: ENVOY_TOOL,
     description:
-      "Start an Envoy: a bounded task in a fresh worktree from the project's default branch, run by an agent in one visible bb thread that opens draft PRs. Only when the user or your instructions call for one.",
+      "Start an Envoy: a bounded task run by an agent in a chat of its own, which opens lanes (visible threads in fresh worktrees, one per repo or PR) that open draft PRs. Only when the user or your instructions call for one.",
     instructions: ENVOY_PROMPT,
     presentation: {
       label: { pending: "Starting Envoy", completed: "Started Envoy" },
@@ -1878,7 +2049,7 @@ export default async function plugin(bb: BbPluginApi) {
         .trim()
         .optional()
         .describe(
-          "The project's id or name; this turn's project when left out",
+          "The project most of the work is in, by id or name; this turn's project when left out",
         ),
       name: z
         .string()
@@ -1928,7 +2099,9 @@ export default async function plugin(bb: BbPluginApi) {
         });
         return [
           `Envoy "${envoy.name}" (${envoy.id}): creation ${envoy.creation}${envoy.error ? ` — ${envoy.error}` : ""}.`,
-          envoy.threadId === null
+          envoy.chatId !== null
+            ? `It has its own chat, where it opens lanes (threads in fresh worktrees) for the work. When it is blocked or needs a decision and the user isn't working with it directly, it reports to this chat with a message starting "[Envoy ${envoy.name}]"; answer with bb sages envoy tell ${envoy.id} "<message>". Never wait for it. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`
+            : envoy.threadId === null
             ? `No thread yet; check it with bb sages envoy show ${envoy.id}, and recover with bb sages envoy recover ${envoy.id}.`
             : `Its thread: @thread:${envoy.threadId}. When it is blocked or needs a decision and the user isn't working with it directly, it reports to this chat with a message starting "[Envoy ${envoy.name}]"; answer with bb thread tell ${envoy.threadId}. Never wait for it. Manage it with bb sages envoy show|park|resume|complete|cancel ${envoy.id}.`,
         ].join("\n");
@@ -1943,6 +2116,20 @@ export default async function plugin(bb: BbPluginApi) {
     const sage = sages.find((candidate) => candidate.id === sageId);
     // Ordinary threads get the CLI skill so "create a sage/acolyte" finds it;
     // sage turns use their own tools instead.
+    if (sage?.envoyId != null) {
+      const envoy = envoys.get(sage.envoyId);
+      return {
+        tools: [
+          ZOOM_TOOL,
+          DATE_TOOL,
+          LANE_TOOL,
+          LANE_MESSAGE_TOOL,
+          ...(envoy?.reportTo ? [REPORT_TOOL] : []),
+        ],
+        skills: [],
+        instructions: envoy ? envoys.chatInstructions(envoy.id) : "",
+      };
+    }
     return sage === undefined
       ? { ...envoys.configure(context), skills: ["sages"] }
       : {

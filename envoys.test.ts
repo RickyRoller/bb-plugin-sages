@@ -26,6 +26,7 @@ const request = {
     projectId: "project-1",
     environment: {
       type: "host",
+      hostId: "host-1",
       workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
     },
     input: [{ type: "text", text: "Fix login crash", mentions: [] }],
@@ -46,8 +47,17 @@ async function setup(
     model?: EnvoyConfig["model"];
     /** Plugins listening for lifecycle changes, by plugin id. */
     lifecycleListeners?: Record<string, (input: any) => unknown>;
+    /** Envoys get a chat (this fake) and work in lanes. */
+    chat?: boolean;
   } = {},
 ) {
+  /** What the fake chat was asked to do. */
+  const chatLog = {
+    opened: [] as string[],
+    delivered: [] as { chatId: string; notice: string; report: string; start: boolean }[],
+    stopped: [] as string[],
+  };
+  const userTurnIds = new Set<string>();
   /** The Automations plugin's records, as its RPCs see them. */
   const automations: {
     id: string;
@@ -83,6 +93,10 @@ async function setup(
         spawn: async (args) => {
           spawnCount++;
           if (options.spawnError) throw options.spawnError;
+          // bb rejects a host workspace without a machine, unless it is personal.
+          const env = (args as any).environment;
+          if (env?.type === "host" && !env.hostId && env.workspace?.type !== "personal")
+            throw new Error("HTTP 400: hostId is required unless workspace.type is personal");
           const thread = makeThreadResponse({
             id: `thread-${spawnCount}`,
             environmentId: "environment-1",
@@ -203,7 +217,24 @@ async function setup(
     instructions: options.instructions ?? "",
     sageInstructions: (sageId) => options.sageInstructions?.[sageId] ?? "",
     model: options.model ?? null,
-  }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }));
+  }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }),
+  options.chat
+    ? {
+        open: async (envoy) => {
+          chatLog.opened.push(envoy.id);
+          return `chat-${envoy.id}`;
+        },
+        deliver: (chatId, notice, report, start) =>
+          void chatLog.delivered.push({ chatId, notice, report, start }),
+        stop: async (chatId) => void chatLog.stopped.push(chatId),
+        lastReply: () => "Both lanes merged-ready and verified",
+        // A chat turn's thread is "turn:<envoy id>".
+        envoyOfTurn: async (threadId) =>
+          threadId.startsWith("turn:") ? threadId.slice(5) : null,
+        userTurn: (threadId) => userTurnIds.has(threadId),
+        rename: () => {},
+      }
+    : null);
   async function sweep() {
     const service = harness.behavior.runService("envoy-recovery");
     await service.done;
@@ -222,6 +253,8 @@ async function setup(
     counts: () => ({ spawnCount, handoffCount }),
     automations,
     reports,
+    chatLog,
+    userTurnIds,
   };
 }
 
@@ -1002,6 +1035,168 @@ test("a cancelled Envoy still stops its child threads", async () => {
     const calls = s.harness.inspection.sdk.callsTo("threads.stop");
     assert.equal(calls.length, before + 1);
     assert.equal((calls.at(-1)![0] as any).threadId, "cancelled-child");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher and reports to the chat", async () => {
+  const listened: any[] = [];
+  const s = await setup({ chat: true, lifecycleListeners: { metro: (input) => listened.push(input.envoy) } });
+  try {
+    const envoy = await s.create();
+    // The Envoy is its chat: no thread or worktree of its own.
+    assert.equal(envoy.chatId, `chat-${envoy.id}`);
+    assert.equal(envoy.threadId, null);
+    assert.equal(envoy.creation, "ready");
+    assert.equal(envoy.lifecycle, "active");
+    assert.deepEqual(s.chatLog.opened, [envoy.id]);
+    assert.equal(s.counts().spawnCount, 0);
+    // A retried create is still a no-op.
+    await s.create();
+    assert.deepEqual(s.chatLog.opened, [envoy.id]);
+
+    // Only a turn of the Envoy's chat opens lanes.
+    const open = (threadId: string, name = "wallet: share card UI") =>
+      s.harness.behavior.callAgentTool(
+        "envoy_open_lane",
+        { project: "Example", name, task: "Build the share card behind enable-takes" },
+        { threadId },
+      );
+    assert.match(JSON.stringify(await open("thread-x")), /Only an Envoy's chat/);
+    assert.match(String(await open(`turn:${envoy.id}`)), /Opened the lane "wallet: share card UI" in Example: @thread:thread-1/);
+    assert.match(JSON.stringify(await open(`turn:${envoy.id}`)), /exists; message it/);
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+    assert.equal(spawn.visibility, "visible");
+    assert.equal(spawn.title, "wallet: share card UI");
+    assert.deepEqual(spawn.environment, { type: "host", hostId: "host-1", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } });
+    assert.equal(spawn.permissionMode, "accept-edits");
+    const record = (await s.harness.behavior.callRpc("envoys_list", null) as any).envoys[0];
+    const lane = record.lanes[0];
+    assert.deepEqual(spawn.pluginMetadata, { envoyId: envoy.id, laneId: lane.id });
+    assert.match(spawn.input[0].text, /You are the lane "wallet: share card UI" of the Envoy/);
+    assert.match(spawn.input.at(-1).text, /^\[From the Envoy\]\nBuild the share card/);
+    assert.equal(lane.threadId, "thread-1");
+
+    // The lane thread gets the PR tool and lane instructions; it maps back to its Envoy.
+    const config = s.helpers.configure(
+      makePluginAgentConfigurationContext({
+        thread: { id: "thread-1" },
+        pluginMetadata: { envoyId: envoy.id, laneId: lane.id },
+      }),
+    );
+    assert.deepEqual(config.tools, ["envoy_attach_pr"]);
+    assert.match(String(config.instructions), /lane "wallet: share card UI"/);
+    const got = await s.harness.behavior.callRpc("envoys_get", { threadId: "thread-1" }) as any;
+    assert.equal(got.id, envoy.id);
+    assert.equal(got.laneId, lane.id);
+
+    // The lane attaches its PR and owns the watcher.
+    const url = "https://github.com/owner/wallet/pull/7";
+    await s.harness.behavior.callAgentTool("envoy_attach_pr", { url }, { threadId: "thread-1" });
+    assert.equal(s.automations.length, 1);
+    assert.equal(s.automations[0]!.createdByThreadId, "thread-1");
+    assert.equal(s.automations[0]!.input.execution.env.ENVOY_THREAD, "thread-1");
+    const attached = (await s.harness.behavior.callRpc("envoys_list", null) as any).envoys[0];
+    assert.deepEqual(attached.prs.map((p: any) => p.url), [url]);
+    assert.deepEqual(attached.lanes[0].prs.map((p: any) => p.url), [url]);
+
+    // A lane turn the chat started reports as a new chat turn; one the user
+    // worked on is only logged. The chat's messages are not the user's.
+    const hook = s.harness.inspection.registrations.hooks["message.dispatch"]!;
+    const dispatch = (text: string) =>
+      hook(makeMessageDispatchHookContext({
+        thread: s.threads.get("thread-1")!,
+        initiator: "user",
+        attempt: "start-turn",
+        input: { text, blocks: [{ type: "text", text, mentions: [] }] },
+      } as any));
+    const idle = (text: string) =>
+      s.harness.behavior.emitThreadEvent("thread.idle", {
+        thread: s.threads.get("thread-1")!,
+        lastAssistantText: text,
+      } as any);
+    // The lane's first message has the issue link ahead of the marker.
+    await dispatch("Linked issue: ABC-123\nhttps://tracker.example.com/team/issue/ABC-123\n[From the Envoy]\nAlso cover the empty state");
+    await idle("Draft PR open, tests pass");
+    await dispatch("Rename the button");
+    await idle("Renamed");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(
+      s.chatLog.delivered.map((d) => [d.start, d.report.split("\n")[0]]),
+      [
+        [true, "[lane wallet: share card UI] report (thread thread-1):"],
+        [false, "[lane wallet: share card UI] turn with the user ended (thread thread-1):"],
+      ],
+    );
+
+    // The chat messages a lane with the marker.
+    assert.match(
+      String(await s.harness.behavior.callAgentTool("envoy_message_lane", { lane: "wallet: share card UI", message: "Rebase on main" }, { threadId: `turn:${envoy.id}` })),
+      /Sent to the lane/,
+    );
+    const sent = s.harness.inspection.sdk.callsTo("threads.send").at(-1)![0] as any;
+    assert.equal(sent.threadId, "thread-1");
+    assert.match(sent.input[0].text, /^\[From the Envoy\]\nRebase on main/);
+
+    // Parking stops the chat and the lanes, removes watchers, and is announced per lane.
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "parked" });
+    assert.deepEqual(s.chatLog.stopped, [`chat-${envoy.id}`]);
+    assert.equal(s.automations.length, 0);
+    assert.deepEqual(listened.at(-1), {
+      id: `${envoy.id}:${lane.id}`,
+      threadId: "thread-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      lifecycle: "parked",
+    });
+    // Resuming watches again and tells the chat to carry on.
+    await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "active" });
+    assert.equal(s.automations.length, 1);
+    assert.match(s.chatLog.delivered.at(-1)!.report, /^\[Envoy resumed\]/);
+    // Completing keeps the chat's last reply and archives the lanes.
+    const done = await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" }) as any;
+    assert.equal(done.result, "Both lanes merged-ready and verified");
+    assert.notEqual(s.threads.get("thread-1")!.archivedAt, null);
+    assert.equal(s.automations.length, 0);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("a lane opened without a project goes in the Envoy's default project", async () => {
+  const s = await setup({ chat: true });
+  try {
+    const envoy = await s.create();
+    const reply = await s.harness.behavior.callAgentTool(
+      "envoy_open_lane",
+      { name: "Share card UI", task: "Build the share card" },
+      { threadId: `turn:${envoy.id}` },
+    );
+    assert.match(String(reply), /Opened the lane "Share card UI" in Example/);
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+    assert.equal(spawn.projectId, "project-1");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("an Envoy's chat reports to its sage only on turns the user did not start", async () => {
+  const s = await setup({ chat: true });
+  try {
+    const envoy = await s.helpers.createTask({
+      task: "Fix the search filter",
+      projectId: "project-1",
+      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+    });
+    const ask = (threadId: string) =>
+      s.harness.behavior.callAgentTool("envoy_report", { message: "Which repo?" }, { threadId });
+    s.userTurnIds.add(`turn:${envoy.id}`);
+    assert.match(String(await ask(`turn:${envoy.id}`)), /Not sent/);
+    s.userTurnIds.clear();
+    assert.match(String(await ask(`turn:${envoy.id}`)), /Sent to the sage "Work Allocator"\. Its reply arrives in this chat/);
+    assert.equal(s.reports.length, 1);
+    assert.match(s.helpers.chatInstructions(envoy.id), /The sage "Work Allocator" started you/);
   } finally {
     await s.harness.lifecycle.dispose();
   }

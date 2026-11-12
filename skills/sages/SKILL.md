@@ -50,7 +50,10 @@ Add `--json` to any command when the output drives code.
 
 ## Envoys
 
-Envoys are standalone task workspaces, each with one stable visible BB thread.
+An Envoy owns one task from a chat of its own (shown on the Sages page). It does
+the work in lanes: visible BB threads, each in a fresh worktree, one per repo or
+PR, each with its specialists as child threads. Envoys from before lanes are one
+thread each.
 Create one only when the user asks for an Envoy or explicitly chooses that workflow.
 Sages and Acolytes already delegate to specialists; do not automatically replace that
 with Envoy creation.
@@ -61,9 +64,13 @@ with Envoy creation.
 - Inside an Envoy started by a sage: report a blocker or a decision you need with
   the `envoy_report` tool, only while the user is not in the conversation. Never
   `bb thread tell` a sage's thread; its turn threads are archived after each turn.
-- `bb sages envoy list [--json]` and `show <id>` inspect tasks. Use returned ids.
-- `bb sages envoy create --project <project-id> --task <directive>` starts work in
-  a fresh worktree. Optional: `--name`, `--issue` (full https issue URL),
+- `bb sages envoy list [--json]` and `show <id>` inspect tasks, with their lanes'
+  threads and PRs. Use returned ids.
+- `bb sages envoy tell <id> <message>` brings a message into an Envoy's chat as a
+  new turn: how a sage answers its report. Message a lane's thread directly only
+  when the user asks to steer that lane.
+- `bb sages envoy create --project <project-id> --task <directive>` starts the
+  Envoy's chat; `--project` is the default project for its lanes. Optional: `--name`, `--issue` (full https issue URL),
   `--specialist` (lead preset), `--request-id` (reuse for deduplication).
   Prefer the New Envoy UI when machine/model/permissions need selection.
 - `bb sages envoy park|resume|complete|cancel <id>` manages task lifecycle. Park
@@ -71,7 +78,7 @@ with Envoy creation.
   cancel stops attached readiness checks and handoff agents. These commands do not
   delete files.
 - `bb sages envoy pr <id> <full-github-pr-url>` attaches an existing task PR.
-  The primary Envoy agent can instead call `envoy_attach_pr` immediately after
+  A lane (or an older Envoy's thread) can instead call `envoy_attach_pr` immediately after
   opening its draft PR. The details dialog can detach a PR or watch it again.
 - `bb sages envoy recover <id>` finds an existing thread after an interrupted
   creation response; it does not resend ambiguous spawns. A definite rejected
