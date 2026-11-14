@@ -39,6 +39,7 @@ import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { EnvoyChatBar, EnvoyList, registerEnvoyApp } from "./envoys-app";
 import { registerSettingsApp } from "./settings-app";
+import { SelectionAddToChat } from "./selection-add-to-chat";
 
 const PANEL_PATH = "sages";
 
@@ -1257,6 +1258,7 @@ function SageChat({ sageId }: { sageId: string }) {
   const [editing, setEditing] = useState(false);
   const [branching, setBranching] = useState(false);
   const [askingClose, setAskingClose] = useState(false);
+  const chatArea = useRef<HTMLDivElement>(null);
   const sage = sages?.find((candidate) => candidate.id === sageId);
   const parent =
     sage?.parentId == null
@@ -1561,7 +1563,8 @@ function SageChat({ sageId }: { sageId: string }) {
           </div>
         </div>
       ) : (
-        <div className="relative flex min-h-0 flex-1 flex-col">
+        <div ref={chatArea} className="relative flex min-h-0 flex-1 flex-col">
+          <SelectionAddToChat root={chatArea} draftKey={`sage:${sage.id}`} />
           {shown === null ? (
             <ScrollToEnd
               watch={sage.stats.messages}
