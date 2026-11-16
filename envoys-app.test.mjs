@@ -383,3 +383,48 @@ test("a lane's header is one Envoy button whose dialog opens the Envoy's chat", 
     slot.lifecycle.unmount();
   }
 });
+
+test("a sage page knows when the running turn's agent waits on the user", async () => {
+  const React = await import("react");
+  const { useAsking } = await import("./app.tsx");
+  const Probe = () => React.createElement("p", null, useAsking("thread-9") ? "asking" : "quiet");
+  const probeApp = await loadPluginApp(
+    definePluginApp((a) => a.slots.experimental_appOverlay({ id: "asking", component: Probe })),
+  );
+  let pending = [];
+  const listeners = [];
+  const slot = renderSlot(probeApp.appOverlays[0], {}, {
+    sdk: {
+      ...sdk,
+      subscribe: (args) => {
+        listeners.push(args);
+        return () => listeners.splice(listeners.indexOf(args), 1);
+      },
+      threads: {
+        ...sdk.threads,
+        interactions: {
+          list: async ({ threadId }) => (threadId === "thread-9" ? pending : []),
+        },
+      },
+    },
+    rpc: {},
+  });
+  const text = () => document.querySelector("p")?.textContent;
+  try {
+    await waitFor(() => assert.equal(listeners.length, 1));
+    assert.equal(listeners[0].event, "thread:changed");
+    assert.equal(listeners[0].threadId, "thread-9");
+    await waitFor(() => assert.equal(text(), "quiet"));
+    pending = [{ id: "pint-1", threadId: "thread-9", status: "pending" }];
+    await act(async () => listeners[0].callback({ entity: "thread", changes: ["title-changed"] }));
+    assert.equal(text(), "quiet", "only interaction changes are looked at");
+    await act(async () => listeners[0].callback({ entity: "thread", changes: ["interactions-changed"] }));
+    await waitFor(() => assert.equal(text(), "asking"));
+    pending = [];
+    await act(async () => listeners[0].callback({ entity: "thread", changes: ["interactions-changed"] }));
+    await waitFor(() => assert.equal(text(), "quiet"));
+  } finally {
+    slot.unmount();
+  }
+  assert.equal(listeners.length, 0, "leaving the page stops listening");
+});

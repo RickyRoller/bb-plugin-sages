@@ -1051,10 +1051,13 @@ function TurnView({
   visible,
   leading,
   trailing,
+  asking,
   onReady,
 }: {
   turn: Turn;
   visible: boolean;
+  /** The agent waits on the user: show bb's composer, which asks it. */
+  asking: boolean;
   leading: ReactNode;
   /** Shown after the turn once it is visible: messages still being sent. */
   trailing: ReactNode;
@@ -1102,17 +1105,29 @@ function TurnView({
       areaRef={area}
       watch={visible}
       className={
-        visible
-          ? "min-h-0 flex-1 overflow-y-auto"
-          : "invisible absolute inset-0 overflow-y-auto"
+        !visible
+          ? `invisible absolute inset-0 ${asking ? "" : "overflow-y-auto"}`
+          : asking
+            ? "relative min-h-0 flex-1"
+            : "min-h-0 flex-1 overflow-y-auto"
       }
     >
-      <div className={CHAT_COLUMN}>
+      <div
+        className={
+          // bb's chat fills its parent's height (h-full), so give it a box
+          // of fixed size: the composer then sits at the bottom.
+          asking
+            ? `${CHAT_COLUMN} absolute inset-x-0 inset-y-0 flex flex-col`
+            : CHAT_COLUMN
+        }
+      >
         <ThreadChat
           threadId={turn.threadId}
-          // Transcript only: the page's one composer stays put.
-          variant="timeline"
-          layout="document"
+          // Transcript only, so the page's one composer stays put; bb's own
+          // while the agent asks the user something, filling the page so
+          // that composer sits at the bottom.
+          variant={asking ? "full" : "timeline"}
+          layout={asking ? "contained" : "document"}
           leadingContent={<div {...{ [LEADING]: "" }}>{leading}</div>}
         />
         {visible ? <div className="px-2 pb-3">{trailing}</div> : null}
@@ -1264,6 +1279,7 @@ function SageChat({ sageId }: { sageId: string }) {
     sage?.parentId == null
       ? undefined
       : sages?.find((candidate) => candidate.id === sage.parentId);
+  const asking = useAsking(sage?.running ? sage.threadId : null);
   // An acolyte's way back is its lead; an Envoy's, the Envoys.
   const toList = () =>
     sage?.envoyId != null
@@ -1589,6 +1605,7 @@ function SageChat({ sageId }: { sageId: string }) {
                 visible={turn === shown}
                 leading={transcript(turn)}
                 trailing={outbox}
+                asking={asking && turn.threadId === sage.threadId}
                 onReady={() => setShown(turn)}
               />
             ),
@@ -1615,8 +1632,7 @@ function SageChat({ sageId }: { sageId: string }) {
           </p>
         )}
         <OpenAcolytes acolytes={openAcolytes} />
-
-        {sage.archivedAt !== null || sage.closing ? null : (
+        {sage.archivedAt !== null || sage.closing || asking ? null : (
           // Its own box: the composer fills its parent's height, so lines
           // above it in a shared box would push its controls out of sight.
           <div>
@@ -1643,6 +1659,38 @@ function SageChat({ sageId }: { sageId: string }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Whether the running turn's agent is waiting on the user (an ask-the-user
+ * tool). bb asks such questions in a thread's own composer, which the
+ * transcript view leaves out, so the page shows bb's chat while one waits.
+ */
+export function useAsking(threadId: string | null): boolean {
+  const sdk = useSdk();
+  const [asking, setAsking] = useState(false);
+  useEffect(() => {
+    setAsking(false);
+    if (threadId === null) return;
+    let live = true;
+    const look = () =>
+      sdk.threads.interactions.list({ threadId }).then((list) => {
+        if (live) setAsking(list.length > 0);
+      }, () => {});
+    look();
+    const unsubscribe = sdk.subscribe({
+      event: "thread:changed",
+      threadId,
+      callback: (change) => {
+        if (change.changes.includes("interactions-changed")) look();
+      },
+    });
+    return () => {
+      live = false;
+      unsubscribe();
+    };
+  }, [sdk, threadId]);
+  return asking;
 }
 
 function SagesPage({ subPath }: PluginNavPanelProps) {
