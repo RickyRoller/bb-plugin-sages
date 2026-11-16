@@ -915,8 +915,13 @@ export async function registerEnvoys(
         // A completed Envoy was archived: bring back its threads and, when
         // the provider can, the worktrees they held.
         for (const owner of owners(envoy)) {
-          const thread = await bb.sdk.threads.get({ threadId: owner.threadId });
-          if (thread.archivedAt === null) continue;
+          const thread = await bb.sdk.threads
+            .get({ threadId: owner.threadId })
+            .catch((error) => {
+              bb.log.warn(`could not find ${owner.threadId}: ${errorText(error)}`);
+              return null;
+            });
+          if (!thread || thread.archivedAt === null) continue;
           await bb.sdk.threads.unarchive({ threadId: owner.threadId });
           const restored = await bb.sdk.threads.get({ threadId: owner.threadId });
           if (restored.canRestoreEnvironment)
@@ -977,8 +982,13 @@ export async function registerEnvoys(
         );
         await announce(get(id));
         if (envoy.chatId && chat) await chat.stop(envoy.chatId).catch(() => {});
+        // A lane whose thread is gone must not keep the others open.
         for (const owner of owners(envoy))
-          await bb.sdk.threads.archive({ threadId: owner.threadId });
+          await bb.sdk.threads
+            .archive({ threadId: owner.threadId })
+            .catch((error) =>
+              bb.log.warn(`could not archive ${owner.threadId}: ${errorText(error)}`),
+            );
         return get(id);
       }
       return update(id, { lifecycle: state });

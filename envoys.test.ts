@@ -140,8 +140,8 @@ async function setup(
         stop: async () => ({ ok: true }),
         archive: async ({ threadId }: { threadId: string }) => {
           const thread = threads.get(threadId);
-          if (thread)
-            threads.set(threadId, { ...thread, archivedAt: Date.now() });
+          if (!thread) throw new Error("HTTP 404: Thread not found");
+          threads.set(threadId, { ...thread, archivedAt: Date.now() });
           return {};
         },
         unarchive: async ({ threadId }: { threadId: string }) => {
@@ -1154,10 +1154,13 @@ test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher 
     await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "active" });
     assert.equal(s.automations.length, 1);
     assert.match(s.chatLog.delivered.at(-1)!.report, /^\[Envoy resumed\]/);
-    // Completing keeps the chat's last reply and archives the lanes.
+    // Completing keeps the chat's last reply and archives the lanes, past
+    // a lane whose thread is gone.
+    assert.match(String(await open(`turn:${envoy.id}`, "Docs")), /@thread:thread-2/);
+    s.threads.delete("thread-1");
     const done = await s.harness.behavior.callRpc("envoys_lifecycle", { id: envoy.id, lifecycle: "completed" }) as any;
     assert.equal(done.result, "Both lanes merged-ready and verified");
-    assert.notEqual(s.threads.get("thread-1")!.archivedAt, null);
+    assert.notEqual(s.threads.get("thread-2")!.archivedAt, null);
     assert.equal(s.automations.length, 0);
   } finally {
     await s.harness.lifecycle.dispose();
