@@ -6,8 +6,8 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 
 /**
- * Fast-forward an explicitly opted-in source and run its install command;
- * never reset or stash user work.
+ * Switch an explicitly opted-in source to its default branch, fast-forward
+ * it and run its install command; never reset or stash user work.
  */
 export async function prepareSource(
   path: string,
@@ -38,9 +38,11 @@ export async function prepareSource(
     const remote = await git("ls-remote", "--symref", "origin", "HEAD");
     const branch = /^ref: refs\/heads\/(.+)\tHEAD$/mu.exec(remote)?.[1];
     if (!branch) throw new Error("Cannot determine origin's default branch");
-    if (await git("symbolic-ref", "--short", "HEAD") !== branch)
-      throw new Error(`Source must be on the default branch (${branch})`);
     await git("fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`);
+    // A clean checkout left on another branch goes back to the default one;
+    // that branch stays as it was.
+    if (await git("rev-parse", "--abbrev-ref", "HEAD") !== branch)
+      await git("switch", branch);
     const commit = await git("rev-parse", `refs/remotes/origin/${branch}^{commit}`);
     try { await git("merge-base", "--is-ancestor", "HEAD", commit); }
     catch { throw new Error("Source has local or divergent commits; refusing to reset them"); }

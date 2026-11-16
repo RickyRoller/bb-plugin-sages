@@ -9,7 +9,7 @@ import { prepareSource } from "./source-preparation.ts";
 
 const exec = promisify(execFile);
 
-test("real Git preparation fetches before running the install command, preserves local work, and releases its lock", async () => {
+test("real Git preparation switches to the default branch, fetches before running the install command, preserves local work, and releases its lock", async () => {
   const root = await mkdtemp(join(tmpdir(), "envoy-source-"));
   const upstream = join(root, "upstream");
   const base = join(root, "base");
@@ -52,6 +52,13 @@ test("real Git preparation fetches before running the install command, preserves
     // A failed install must be retriable, and the lock released.
     await assert.rejects(prepareSource(base, "exit 7"), /code 7|exit 7|failed/i);
     assert.equal((await prepareSource(base, install)).commit, local);
+    // A clean checkout on another branch switches back and keeps that branch.
+    await git(base, "switch", "-c", "feature");
+    await git(base, "commit", "--allow-empty", "-m", "chore: feature work");
+    const feature = await git(base, "rev-parse", "HEAD");
+    assert.equal((await prepareSource(base, "")).branch, "main");
+    assert.equal(await git(base, "rev-parse", "--abbrev-ref", "HEAD"), "main");
+    assert.equal(await git(base, "rev-parse", "feature"), feature);
     // An empty install command only fast-forwards.
     const head = await commit("skipped.txt", "skipped\n", "chore: no install");
     assert.equal((await prepareSource(base, "")).commit, head);
