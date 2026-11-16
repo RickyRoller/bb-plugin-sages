@@ -21,7 +21,7 @@ const envoy = (id: string, threadId: string | null, issue = true): Envoy =>
     creation: "ready",
     error: null,
     issue: issue
-      ? { key: "WAL-1", url: "https://linear.app/wallet/issue/WAL-1" }
+      ? { key: "APP-1", url: "https://linear.app/acme/issue/APP-1" }
       : null,
     specialist: null,
     prs: [],
@@ -63,8 +63,8 @@ function setup(
   });
   registerSidebarSection(bb, {
     sages: () => [
-      { id: "lead", name: "Wallet", parentId: null },
-      { id: "open", name: "Swaps", parentId: "lead", archivedAt: null },
+      { id: "lead", name: "Web", parentId: null },
+      { id: "open", name: "Search", parentId: "lead", archivedAt: null },
       { id: "closed", name: "Old", parentId: "lead", archivedAt: "2026-01-01" },
     ],
     reorderSages: async (ids) => {
@@ -86,15 +86,15 @@ test("sections list sages with open acolytes and claim only the asked Envoy thre
   const [sages, envoys] = sections;
   assert.deepEqual(
     sages.links.map((l: any) => [l.label, l.children.map((c: any) => c.label)]),
-    [["Wallet", ["Swaps"]]],
+    [["Web", ["Search"]]],
   );
   assert.deepEqual(envoys.threads.map((t: any) => t.threadId), ["thread-a"]);
   assert.deepEqual(envoys.threads[0].badges[0], {
-    label: "[WAL-1]",
+    label: "[APP-1]",
     tone: "neutral",
     placement: "meta",
-    href: "https://linear.app/wallet/issue/WAL-1",
-    title: "https://linear.app/wallet/issue/WAL-1",
+    href: "https://linear.app/acme/issue/APP-1",
+    title: "https://linear.app/acme/issue/APP-1",
   });
   await s.harness.behavior.callRpc("sidebar-section.v1.reorder", {
     sectionId: "sages",
@@ -105,11 +105,11 @@ test("sections list sages with open acolytes and claim only the asked Envoy thre
 
 test("decorator badges follow the issue badge; malformed rows and failing decorators add nothing", async () => {
   const s = setup({
-    "metro-control": ({ envoys }) => ({
+    "dev-servers": ({ envoys }) => ({
       decorations: [
-        { envoyId: "a", badges: [{ label: "Metro :8099", tone: "success" }] },
+        { envoyId: "a", badges: [{ label: "Server :8099", tone: "success" }] },
         { envoyId: "b", badges: [{ label: "" }] },
-        ...envoys.map((e: any) => ({ envoyId: e.id, badges: [{ label: "iOS sim", tone: "info" }] })),
+        ...envoys.map((e: any) => ({ envoyId: e.id, badges: [{ label: "Simulator", tone: "info" }] })),
       ],
     }),
     broken: () => {
@@ -118,9 +118,9 @@ test("decorator badges follow the issue badge; malformed rows and failing decora
   });
   const { sections } = await s.get(["thread-a", "thread-b"]);
   const labels = sections[1].threads.map((t: any) => t.badges.map((b: any) => b.label));
-  assert.deepEqual(labels, [["[WAL-1]", "Metro :8099", "iOS sim"], ["iOS sim"]]);
-  const metroCall = s.calls.find((c) => c.pluginId === "metro-control")!;
-  assert.deepEqual(metroCall.input.envoys[0], {
+  assert.deepEqual(labels, [["[APP-1]", "Server :8099", "Simulator"], ["Simulator"]]);
+  const serverCall = s.calls.find((c) => c.pluginId === "dev-servers")!;
+  assert.deepEqual(serverCall.input.envoys[0], {
     id: "a",
     threadId: "thread-a",
     projectId: "project-1",
@@ -131,8 +131,8 @@ test("decorator badges follow the issue badge; malformed rows and failing decora
 
 test("hidden sources are not asked and the issue badge can be hidden", async () => {
   const s = setup(
-    { "metro-control": () => ({ decorations: [] }) },
-    ["issue", "metro-control"],
+    { "dev-servers": () => ({ decorations: [] }) },
+    ["issue", "dev-servers"],
   );
   const { sections } = await s.get(["thread-a"]);
   assert.deepEqual(sections[1].threads[0].badges, []);
@@ -142,7 +142,7 @@ test("hidden sources are not asked and the issue badge can be hidden", async () 
     {
       sources: [
         { id: "issue", label: "Issue link" },
-        { id: "metro-control", label: "metro-control plugin" },
+        { id: "dev-servers", label: "dev-servers plugin" },
       ],
     },
   );
@@ -185,8 +185,8 @@ test("an Envoy with a chat heads its lanes; each lane gets its own workspace bad
     environmentId: null,
     chatId: "chat-d",
     lanes: [
-      { id: "l1", name: "wallet: UI", projectId: "project-1", threadId: "lane-1", environmentId: "env-l1", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
-      { id: "l2", name: "backend: API", projectId: "project-2", threadId: "lane-2", environmentId: "env-l2", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
+      { id: "l1", name: "Web UI", projectId: "project-1", threadId: "lane-1", environmentId: "env-l1", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
+      { id: "l2", name: "Server API", projectId: "project-2", threadId: "lane-2", environmentId: "env-l2", creation: "ready", error: null, createdAt: "2026-10-26T00:00:00Z" },
     ],
   });
   const asked: any[] = [];
@@ -196,11 +196,11 @@ test("an Envoy with a chat heads its lanes; each lane gets its own workspace bad
       threads: { get: async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId }) },
       plugins: {
         experimental_discoverRpc: async ({ method }: { method: string }) =>
-          [{ pluginId: "metro", method, displayName: "Metro" }],
+          [{ pluginId: "dev-servers", method, displayName: "Dev servers" }],
         callRpc: async (args: any) => {
           if (args.pluginId === "sidebar-thread-details") return { ok: true };
           asked.push(...args.input.envoys);
-          return { decorations: [{ envoyId: "d:l1", badges: [{ label: "Metro 8081" }] }] };
+          return { decorations: [{ envoyId: "d:l1", badges: [{ label: "Server 8081" }] }] };
         },
       },
     } as any,
@@ -224,10 +224,10 @@ test("an Envoy with a chat heads its lanes; each lane gets its own workspace bad
   assert.equal(group.kind, "Envoy");
   assert.equal(group.threadKind, "Lane");
   assert.equal(group.icon, null);
-  assert.deepEqual(group.badges.map((b: any) => b.label), ["[WAL-1]"]);
+  assert.deepEqual(group.badges.map((b: any) => b.label), ["[APP-1]"]);
   // Only lanes in the sidebar are listed, each with its own badges.
   assert.deepEqual(group.threads, [
-    { threadId: "lane-1", activityAt: null, badges: [{ label: "Metro 8081", tone: "neutral", placement: "meta", href: null, title: null }] },
+    { threadId: "lane-1", activityAt: null, badges: [{ label: "Server 8081", tone: "neutral", placement: "meta", href: null, title: null }] },
   ]);
   // Decorators see each lane as a workspace of its own.
   assert.deepEqual(asked.map((each) => each.id), ["a", "d:l1", "d:l2"]);

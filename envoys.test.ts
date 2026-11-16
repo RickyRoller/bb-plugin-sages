@@ -551,7 +551,7 @@ test("lifecycle listeners hear each change, a completed Envoy before its thread 
   const heard: string[] = [];
   const s: Awaited<ReturnType<typeof setup>> = await setup({
     lifecycleListeners: {
-      "metro-control": ({ envoy }) => {
+      "dev-servers": ({ envoy }) => {
         const archived = s.harness.inspection.sdk.callsTo("threads.archive").length;
         heard.push(`${envoy.lifecycle}:${envoy.environmentId}:${archived}`);
         return {};
@@ -761,11 +761,11 @@ test("an Envoy reports to its sage only when it needs a decision and the user is
     const envoy = await s.helpers.createTask({
       task: "Fix the search filter",
       projectId: "project-1",
-      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+      reportTo: { sageId: "sage-1", name: "Planner" },
     });
-    assert.deepEqual(envoy.reportTo, { sageId: "sage-1", name: "Work Allocator" });
+    assert.deepEqual(envoy.reportTo, { sageId: "sage-1", name: "Planner" });
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
-    assert.match(spawn.input[0].text, /started by the sage "Work Allocator"\. When you are blocked or need a decision while the user is not in the conversation/);
+    assert.match(spawn.input[0].text, /started by the sage "Planner"\. When you are blocked or need a decision while the user is not in the conversation/);
     assert.match(spawn.input[0].text, /if your task names a thread to message or another return route, ignore it/);
     const tools = (threadId: string, envoyId: string) =>
       s.helpers.configure(
@@ -808,7 +808,7 @@ test("an Envoy reports to its sage only when it needs a decision and the user is
 
     // A child thread finishing starts an automated turn: the sage hears it.
     await dispatch("[bb system] @thread:child completed", "system");
-    assert.match(String(await ask()), /Sent to the sage "Work Allocator"/);
+    assert.match(String(await ask()), /Sent to the sage "Planner"/);
     // The user joining that running turn brings them into it.
     await dispatch("Wait, one more thing", "user", "join-turn");
     assert.match(String(await ask()), /Not sent/);
@@ -850,7 +850,7 @@ test("a sage's Envoy instructions replace the global ones for Envoys it starts",
     const fromSage = await s.helpers.createTask({
       task: "Fix the search filter",
       projectId: "project-1",
-      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+      reportTo: { sageId: "sage-1", name: "Planner" },
     });
     const fromOther = await s.helpers.createTask({
       task: "Fix the badge",
@@ -866,7 +866,7 @@ test("a sage's Envoy instructions replace the global ones for Envoys it starts",
       assert.match(spawn, /Global: run the full lint\./);
       assert.match(instructions(envoy.threadId!, envoy.id), /Global: run the full lint\./);
     }
-    assert.match(spawns[1]!, /from the sage "Work Allocator".*\nSage: scoped lint only\./s);
+    assert.match(spawns[1]!, /from the sage "Planner".*\nSage: scoped lint only\./s);
     assert.doesNotMatch(spawns[1]!, /Global/);
     assert.match(instructions(fromSage.threadId!, fromSage.id), /Sage: scoped lint only\./);
     assert.match(spawns[1]!, /All pull requests you open must be DRAFT/);
@@ -1042,7 +1042,7 @@ test("a cancelled Envoy still stops its child threads", async () => {
 
 test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher and reports to the chat", async () => {
   const listened: any[] = [];
-  const s = await setup({ chat: true, lifecycleListeners: { metro: (input) => listened.push(input.envoy) } });
+  const s = await setup({ chat: true, lifecycleListeners: { servers: (input) => listened.push(input.envoy) } });
   try {
     const envoy = await s.create();
     // The Envoy is its chat: no thread or worktree of its own.
@@ -1057,25 +1057,25 @@ test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher 
     assert.deepEqual(s.chatLog.opened, [envoy.id]);
 
     // Only a turn of the Envoy's chat opens lanes.
-    const open = (threadId: string, name = "wallet: share card UI") =>
+    const open = (threadId: string, name = "Settings page UI") =>
       s.harness.behavior.callAgentTool(
         "envoy_open_lane",
-        { project: "Example", name, task: "Build the share card behind enable-takes" },
+        { project: "Example", name, task: "Build the settings page" },
         { threadId },
       );
     assert.match(JSON.stringify(await open("thread-x")), /Only an Envoy's chat/);
-    assert.match(String(await open(`turn:${envoy.id}`)), /Opened the lane "wallet: share card UI" in Example: @thread:thread-1/);
+    assert.match(String(await open(`turn:${envoy.id}`)), /Opened the lane "Settings page UI" in Example: @thread:thread-1/);
     assert.match(JSON.stringify(await open(`turn:${envoy.id}`)), /exists; message it/);
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
     assert.equal(spawn.visibility, "visible");
-    assert.equal(spawn.title, "wallet: share card UI");
+    assert.equal(spawn.title, "Settings page UI");
     assert.deepEqual(spawn.environment, { type: "host", hostId: "host-1", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } });
     assert.equal(spawn.permissionMode, "accept-edits");
     const record = (await s.harness.behavior.callRpc("envoys_list", null) as any).envoys[0];
     const lane = record.lanes[0];
     assert.deepEqual(spawn.pluginMetadata, { envoyId: envoy.id, laneId: lane.id });
-    assert.match(spawn.input[0].text, /You are the lane "wallet: share card UI" of the Envoy/);
-    assert.match(spawn.input.at(-1).text, /^\[From the Envoy\]\nBuild the share card/);
+    assert.match(spawn.input[0].text, /You are the lane "Settings page UI" of the Envoy/);
+    assert.match(spawn.input.at(-1).text, /^\[From the Envoy\]\nBuild the settings page/);
     assert.equal(lane.threadId, "thread-1");
 
     // The lane thread gets the PR tool and lane instructions; it maps back to its Envoy.
@@ -1086,13 +1086,13 @@ test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher 
       }),
     );
     assert.deepEqual(config.tools, ["envoy_attach_pr"]);
-    assert.match(String(config.instructions), /lane "wallet: share card UI"/);
+    assert.match(String(config.instructions), /lane "Settings page UI"/);
     const got = await s.harness.behavior.callRpc("envoys_get", { threadId: "thread-1" }) as any;
     assert.equal(got.id, envoy.id);
     assert.equal(got.laneId, lane.id);
 
     // The lane attaches its PR and owns the watcher.
-    const url = "https://github.com/owner/wallet/pull/7";
+    const url = "https://github.com/owner/app/pull/7";
     await s.harness.behavior.callAgentTool("envoy_attach_pr", { url }, { threadId: "thread-1" });
     assert.equal(s.automations.length, 1);
     assert.equal(s.automations[0]!.createdByThreadId, "thread-1");
@@ -1125,14 +1125,14 @@ test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher 
     assert.deepEqual(
       s.chatLog.delivered.map((d) => [d.start, d.report.split("\n")[0]]),
       [
-        [true, "[lane wallet: share card UI] report (thread thread-1):"],
-        [false, "[lane wallet: share card UI] turn with the user ended (thread thread-1):"],
+        [true, "[lane Settings page UI] report (thread thread-1):"],
+        [false, "[lane Settings page UI] turn with the user ended (thread thread-1):"],
       ],
     );
 
     // The chat messages a lane with the marker.
     assert.match(
-      String(await s.harness.behavior.callAgentTool("envoy_message_lane", { lane: "wallet: share card UI", message: "Rebase on main" }, { threadId: `turn:${envoy.id}` })),
+      String(await s.harness.behavior.callAgentTool("envoy_message_lane", { lane: "Settings page UI", message: "Rebase on main" }, { threadId: `turn:${envoy.id}` })),
       /Sent to the lane/,
     );
     const sent = s.harness.inspection.sdk.callsTo("threads.send").at(-1)![0] as any;
@@ -1170,10 +1170,10 @@ test("a lane opened without a project goes in the Envoy's default project", asyn
     const envoy = await s.create();
     const reply = await s.harness.behavior.callAgentTool(
       "envoy_open_lane",
-      { name: "Share card UI", task: "Build the share card" },
+      { name: "Settings page UI", task: "Build the settings page" },
       { threadId: `turn:${envoy.id}` },
     );
-    assert.match(String(reply), /Opened the lane "Share card UI" in Example/);
+    assert.match(String(reply), /Opened the lane "Settings page UI" in Example/);
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
     assert.equal(spawn.projectId, "project-1");
   } finally {
@@ -1187,16 +1187,16 @@ test("an Envoy's chat reports to its sage only on turns the user did not start",
     const envoy = await s.helpers.createTask({
       task: "Fix the search filter",
       projectId: "project-1",
-      reportTo: { sageId: "sage-1", name: "Work Allocator" },
+      reportTo: { sageId: "sage-1", name: "Planner" },
     });
     const ask = (threadId: string) =>
       s.harness.behavior.callAgentTool("envoy_report", { message: "Which repo?" }, { threadId });
     s.userTurnIds.add(`turn:${envoy.id}`);
     assert.match(String(await ask(`turn:${envoy.id}`)), /Not sent/);
     s.userTurnIds.clear();
-    assert.match(String(await ask(`turn:${envoy.id}`)), /Sent to the sage "Work Allocator"\. Its reply arrives in this chat/);
+    assert.match(String(await ask(`turn:${envoy.id}`)), /Sent to the sage "Planner"\. Its reply arrives in this chat/);
     assert.equal(s.reports.length, 1);
-    assert.match(s.helpers.chatInstructions(envoy.id), /The sage "Work Allocator" started you/);
+    assert.match(s.helpers.chatInstructions(envoy.id), /The sage "Planner" started you/);
   } finally {
     await s.harness.lifecycle.dispose();
   }

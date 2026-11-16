@@ -1218,7 +1218,7 @@ export async function registerEnvoys(
         .min(1)
         .optional()
         .describe("The project's id or name, from the list after the view. Omit it to use the Envoy's default project"),
-      name: z.string().trim().min(1).max(60).describe("A few words naming the lane's part, e.g. \"Share card UI\""),
+      name: z.string().trim().min(1).max(60).describe("A few words naming the lane's part, e.g. \"Settings page UI\""),
       task: z
         .string()
         .trim()

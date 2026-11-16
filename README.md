@@ -139,10 +139,10 @@ default project, model and permissions.
 **Three levels.** In the sidebar's Envoys section:
 
 ```
-✈ Takes share cards            ← the Envoy: opens its chat
-│ [LANE] wallet: share card     ← a lane: a thread in its own worktree
-│   └ device-validator run      ← a child thread the lane started
-│ [LANE] backend: take kind
+Dark mode                      ← the Envoy: opens its chat
+│ Theme tokens                  ← a lane: a thread in its own worktree
+│   └ reviewer run              ← a child thread the lane started
+│ Settings API
 ```
 
 **The chat.** The Envoy's chat works like a sage's: it never ends, and each
@@ -207,7 +207,7 @@ can fix it and send again. If the result is unclear, Sages never resends:
 
 ```sh
 bb sages list
-bb sages create 'Wallet' --topic 'Phantom wallet app' --project <project-id>
+bb sages create 'Web app' --topic 'Customer web app' --project <project-id>
 bb sages show <sage-id>
 bb sages edit <sage-id> --instructions-file notes.md
 bb sages edit <sage-id> --envoy-instructions 'Run the iOS tests before a PR'
@@ -305,9 +305,9 @@ is announced before its thread is archived, so its environment can still be
 read. A listener gets 3 seconds, so it should do slow work in the background.
 A failure is only logged.
 
-The Metro Control plugin uses both. It shows
-each Envoy's Metro server and simulators as badges, and stops them when the
-Envoy is parked, completed or cancelled.
+For example, a plugin that runs dev servers per worktree can show each
+Envoy's server as a badge and stop it when the Envoy is parked, completed or
+cancelled.
 
 The plugin also publishes `sidebar-section.v1.get`, which Sidebar Thread
 Details uses to draw the Sages and Envoys sections.

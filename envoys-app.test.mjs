@@ -350,7 +350,7 @@ test("a lane's header is one Envoy button whose dialog opens the Envoy's chat", 
     lanes: [
       {
         id: "lane-1",
-        name: "wallet: share card",
+        name: "Theme tokens",
         projectId: "project-1",
         threadId: "thread-1",
         environmentId: "environment-1",

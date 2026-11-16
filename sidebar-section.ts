@@ -4,8 +4,7 @@
 // Sidebar Thread Details finds section providers by the discoverable method
 // `sidebar-section.v1.get` and draws what they return, so this plugin decides
 // what its sections hold. Envoy badges start with the issue link; any plugin
-// that publishes a discoverable `envoy-decorations.v1.get` adds its own (the
-// Metro Control plugin shows each Envoy's Metro and validation devices). The
+// that publishes a discoverable `envoy-decorations.v1.get` adds its own. The
 // user hides a source in the Sages settings.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
