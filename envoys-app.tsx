@@ -458,6 +458,43 @@ function LaneList({
     </ul>
   );
 }
+/** The lane threads that are archived or gone, kept current as they change. */
+function useArchivedThreads(lanes: readonly Lane[]) {
+  const sdk = useSdk();
+  const [archived, setArchived] = useState<ReadonlySet<string>>(new Set());
+  const ids = lanes.flatMap((lane) => (lane.threadId ? [lane.threadId] : []));
+  const key = ids.join(",");
+  useEffect(() => {
+    let live = true;
+    const look = () =>
+      Promise.allSettled(ids.map((threadId) => sdk.threads.get({ threadId }))).then((results) => {
+        if (!live) return;
+        setArchived(
+          new Set(
+            ids.filter((_, index) => {
+              const result = results[index]!;
+              return result.status === "rejected" || result.value.archivedAt !== null;
+            }),
+          ),
+        );
+      });
+    look();
+    const unsubscribes = ids.map((threadId) =>
+      sdk.subscribe({
+        event: "thread:changed",
+        threadId,
+        callback: (change) => {
+          if (change.changes.includes("archived-changed")) look();
+        },
+      }),
+    );
+    return () => {
+      live = false;
+      for (const unsubscribe of unsubscribes) unsubscribe();
+    };
+  }, [sdk, key]);
+  return archived;
+}
 /** The bar under an Envoy's chat header: its state, lanes and details. */
 export function EnvoyChatBar({ envoyId }: { envoyId: string }) {
   const { envoys } = useEnvoys();
@@ -471,7 +508,9 @@ export function EnvoyChatBar({ envoyId }: { envoyId: string }) {
     );
   }, [sdk]);
   const envoy = envoys.find((each) => each.id === envoyId);
+  const archived = useArchivedThreads(envoy?.lanes ?? []);
   if (!envoy) return null;
+  const lanes = envoy.lanes.filter((lane) => !archived.has(lane.threadId ?? ""));
   return (
     <div className="flex shrink-0 flex-col gap-1.5 border-b border-border px-4 py-2">
       <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -480,15 +519,15 @@ export function EnvoyChatBar({ envoyId }: { envoyId: string }) {
         </span>
         {envoy.issue ? <UrlLink href={envoy.issue.url}>{envoy.issue.key}</UrlLink> : null}
         <span className="text-muted-foreground">
-          {envoy.lanes.length
-            ? `${envoy.lanes.length} ${envoy.lanes.length === 1 ? "lane" : "lanes"}`
-            : "No lanes yet"}
+          {lanes.length
+            ? `${lanes.length} ${lanes.length === 1 ? "lane" : "lanes"}`
+            : "No open lanes"}
         </span>
         <Button variant="ghost" className="ml-auto h-6 px-2 text-xs" onClick={() => setOpen(true)}>
           Details
         </Button>
       </div>
-      {envoy.lanes.length ? <LaneList lanes={envoy.lanes} projects={projects} /> : null}
+      {lanes.length ? <LaneList lanes={lanes} projects={projects} /> : null}
       {open ? <EnvoyDetails envoy={envoy} onClose={() => setOpen(false)} /> : null}
     </div>
   );
