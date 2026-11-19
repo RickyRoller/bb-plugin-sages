@@ -88,6 +88,8 @@ export const laneSchema = z.object({
   error: z.string().nullable(),
   prs: z.array(prSchema).default([]),
   createdAt: z.string(),
+  /** The lane that took over after this one stopped replying. */
+  replacedBy: z.string().nullable().default(null),
 });
 export type Lane = z.infer<typeof laneSchema>;
 export const envoySchema = z.object({

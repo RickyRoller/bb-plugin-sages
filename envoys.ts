@@ -579,16 +579,36 @@ export async function registerEnvoys(
    */
   async function openLane(
     id: string,
-    { projectId, name, task }: { projectId: string; name: string; task: string },
+    {
+      projectId,
+      name,
+      task,
+      replaces,
+    }: {
+      projectId: string;
+      name: string;
+      task: string;
+      /** The id or name of a lane that stopped replying, which this one takes over. */
+      replaces?: string;
+    },
   ) {
     return serial(id, async () => {
       const envoy = get(id);
       if (!envoy.chatId) throw new Error("Only an Envoy with a chat opens lanes");
       if (envoy.lifecycle !== "active")
         throw new Error(`This Envoy is ${envoy.lifecycle}; resume it to open lanes`);
+      const old = replaces === undefined ? undefined : currentLane(envoy, replaces);
+      if (replaces !== undefined && !old?.threadId)
+        throw new Error(`No open lane "${replaces}" to replace; the lanes are listed after the view`);
       const key = name.trim().toLowerCase();
-      if (envoy.lanes.some((lane) => lane.name.toLowerCase() === key && lane.creation !== "failed"))
+      if (envoy.lanes.some((lane) => lane !== old && lane.replacedBy === null && lane.name.toLowerCase() === key && lane.creation !== "failed"))
         throw new Error(`A lane named "${name}" exists; message it, or give the new one another name`);
+      if (old)
+        task += [
+          `\n\nYou take over from the lane "${old.name}" (thread ${old.threadId}), which stopped replying. It is archived once you report back, so carry over what you need first.`,
+          `Its worktree, branch and any unpushed changes: bb environment show ${old.environmentId ?? "(see bb thread show " + old.threadId + ")"}.`,
+          old.prs.length ? `Its PRs are yours now: ${old.prs.map((pr) => pr.url).join(", ")}. Work on their branches.` : "",
+        ].join("\n");
       const lane: Lane = {
         id: randomUUID().slice(0, 8),
         name: name.trim(),
@@ -599,6 +619,7 @@ export async function registerEnvoys(
         error: null,
         prs: [],
         createdAt: new Date().toISOString(),
+        replacedBy: null,
       };
       const setLane = (patch: Partial<Lane>) =>
         update(id, {
@@ -647,7 +668,9 @@ export async function registerEnvoys(
             { type: "text", text: `${LANE_MARKER}\n${task}`, mentions: [] },
           ],
         });
-        return { envoy: setLane({ threadId: thread.id, environmentId: thread.environmentId, creation: "ready", error: null }), lane: { ...lane, threadId: thread.id } };
+        setLane({ threadId: thread.id, environmentId: thread.environmentId, creation: "ready", error: null });
+        if (old) await takeOver(id, old, { ...lane, threadId: thread.id });
+        return { envoy: get(id), lane: { ...lane, threadId: thread.id } };
       } catch (error) {
         const definite = definiteRejection(error);
         setLane({
@@ -659,6 +682,35 @@ export async function registerEnvoys(
         throw new Error(definite ? `Launch rejected: ${errorText(error)}` : `Launch unconfirmed: ${errorText(error)}; do not open it again yet`);
       }
     });
+  }
+  /**
+   * A replacement lane takes over a lane that stopped replying: its PRs, and
+   * the watchers on them. The old lane is archived once the new one reports.
+   */
+  async function takeOver(id: string, old: Lane, next: Lane) {
+    update(id, {
+      lanes: get(id).lanes.map((each) =>
+        each.id === old.id
+          ? { ...each, replacedBy: next.id, prs: [] }
+          : each.id === next.id
+            ? { ...each, prs: old.prs }
+            : each,
+      ),
+    });
+    try {
+      await unwatch(get(id), undefined, [{ threadId: old.threadId!, projectId: old.projectId }]);
+      for (const pr of old.prs) await watch({ threadId: next.threadId!, projectId: next.projectId }, pr.url);
+    } catch (error) {
+      bb.log.warn(`could not move PR watchers to the lane "${next.name}": ${errorText(error)}`);
+    }
+  }
+  /** A lane by id or name; by name, the one in use, not one it replaced. */
+  function currentLane(envoy: Envoy, which: string) {
+    const key = which.toLowerCase();
+    return (
+      envoy.lanes.find((lane) => lane.id === which) ??
+      envoy.lanes.find((lane) => lane.replacedBy === null && lane.name.toLowerCase() === key)
+    );
   }
   /**
    * The machine a new worktree goes on: the request's host when it names one,
@@ -1235,8 +1287,14 @@ export async function registerEnvoys(
         .min(1)
         .max(100_000)
         .describe("A self-contained brief: the lane sees none of this chat. Its part of the goal, relevant paths and facts, constraints, how to verify it, what done looks like, and what other lanes do that it depends on."),
+      replaces: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("The name or id of a lane that broke (stopped replying). The new lane takes over its PRs and work, and the old one is archived once the new one reports"),
     }),
-    execute: async ({ project, name, task }, { threadId }) => {
+    execute: async ({ project, name, task, replaces }, { threadId }) => {
       try {
         const envoy = await envoyOfChatTurn(threadId);
         const projects = await bb.sdk.projects.list({ includePersonal: false });
@@ -1247,7 +1305,7 @@ export async function registerEnvoys(
           projects.find((each) => each.name.toLowerCase() === key);
         if (!match)
           throw new Error(`No project "${project}". Projects: ${projects.map((each) => `${each.name} (${each.id})`).join(", ")}`);
-        const { lane } = await openLane(envoy.id, { projectId: match.id, name, task });
+        const { lane } = await openLane(envoy.id, { projectId: match.id, name, task, replaces });
         return `Opened the lane "${lane.name}" in ${match.name}: @thread:${lane.threadId}. Its report reaches this chat as a message starting "[lane ${lane.name}]" when the turn you started ends. Don't wait for it or do its work meanwhile.`;
       } catch (error) {
         return { content: [{ type: "text" as const, text: errorText(error) }], isError: true };
@@ -1266,10 +1324,7 @@ export async function registerEnvoys(
     execute: async ({ lane: which, message }, { threadId }) => {
       try {
         const envoy = await envoyOfChatTurn(threadId);
-        const key = which.toLowerCase();
-        const lane = envoy.lanes.find(
-          (each) => each.id === which || each.name.toLowerCase() === key,
-        );
+        const lane = currentLane(envoy, which);
         if (!lane?.threadId)
           throw new Error(`No open lane "${which}"; the lanes are listed after the view`);
         if (envoy.lifecycle !== "active")
@@ -1408,34 +1463,88 @@ export async function registerEnvoys(
   // A lane's turn ends: what it says goes to its Envoy's chat. A turn the
   // chat started (or a watcher's notice) starts a chat turn; one the user
   // worked on with the lane is only logged, so the chat stays current.
-  function laneEnded(threadId: string, text: string, failed: boolean) {
+  function laneEnded(threadId: string, text: string, kind: "report" | "failed" | "broke") {
     const found = laneOf(threadId);
     const chatId = found?.envoy.chatId;
     if (!found || !chatId || !chat) return;
     const { envoy, lane } = found;
-    const byUser = userTurns.has(threadId) && !failed;
+    const byUser = userTurns.has(threadId) && kind === "report";
     if (envoy.lifecycle !== "active" && !byUser) return;
+    const label = byUser ? "turn with the user ended" : kind;
     chat.deliver(
       chatId,
-      `Lane ${lane.name} ${failed ? "failed" : byUser ? "worked with the user" : "reported"}`,
-      `[lane ${lane.name}] ${failed ? "failed" : byUser ? "turn with the user ended" : "report"} (thread ${threadId}):\n${text}`,
+      `Lane ${lane.name} ${byUser ? "worked with the user" : kind === "report" ? "reported" : kind}`,
+      `[lane ${lane.name}] ${label} (thread ${threadId}):\n${text}`,
       !byUser,
     );
   }
+  /** Lanes retried once after a turn the Envoy started ended with no reply. */
+  const retried = new Set<string>();
+  /**
+   * Why a turn's last text is no reply, or null when it is one. A provider
+   * that stops a turn leaves "incomplete: <reason>", e.g. content_filter.
+   */
+  function noReply(text: string | null): string | null {
+    if (text === null || text.trim() === "") return "its turn ended with no reply";
+    const stopped = /^incomplete:\s*(.+)$/.exec(text.trim());
+    return stopped ? `the provider stopped its turn (${stopped[1]})` : null;
+  }
+  /** Archives the lanes a lane replaced, once it has reported. */
+  async function retireReplaced(id: string, laneId: string) {
+    for (const old of get(id).lanes)
+      if (old.replacedBy === laneId && old.threadId)
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: old.threadId });
+          if (!thread.archivedAt) await bb.sdk.threads.archive({ threadId: old.threadId });
+        } catch (error) {
+          bb.log.warn(`could not archive the replaced lane ${old.threadId}: ${errorText(error)}`);
+        }
+  }
+  // A lane that breaks on a turn the Envoy started (no reply, or stopped by
+  // its provider) usually works when asked again: it is retried once before
+  // the chat hears, so the chat replaces only a lane that stays broken.
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
-    if (!laneOf(thread.id)) return;
-    void (async () =>
-      laneEnded(
-        thread.id,
+    const found = laneOf(thread.id);
+    if (!found) return;
+    const { envoy, lane } = found;
+    void (async () => {
+      const text =
         lastAssistantText ??
-          (await bb.sdk.threads.output({ threadId: thread.id })).output ??
-          "(no reply)",
-        false,
-      ))().catch((error) => bb.log.warn(`could not report a lane: ${errorText(error)}`));
+        (await bb.sdk.threads.output({ threadId: thread.id })).output;
+      const broken = noReply(text);
+      const automated =
+        !userTurns.has(thread.id) && envoy.lifecycle === "active" && lane.replacedBy === null;
+      if (broken && automated && !retried.has(thread.id)) {
+        retried.add(thread.id);
+        await bb.sdk.threads.send({
+          threadId: thread.id,
+          mode: "auto",
+          input: [
+            {
+              type: "text",
+              text: `${LANE_MARKER}\nYour last turn ended without a reply: ${broken}. Pick up where you left off, and end with a reply.`,
+              mentions: [],
+            },
+          ],
+        });
+        return;
+      }
+      retried.delete(thread.id);
+      if (broken && automated) {
+        laneEnded(
+          thread.id,
+          `It is broken: ${broken}, again after one automatic retry. Open a lane to replace it with envoy_open_lane and replaces: "${lane.name}".`,
+          "broke",
+        );
+        return;
+      }
+      laneEnded(thread.id, text ?? "(no reply)", "report");
+      if (!broken) await retireReplaced(envoy.id, lane.id);
+    })().catch((error) => bb.log.warn(`could not report a lane: ${errorText(error)}`));
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     if (laneOf(thread.id)) {
-      laneEnded(thread.id, error ?? "no error given", true);
+      laneEnded(thread.id, error ?? "no error given", "failed");
       return;
     }
     const envoy = [...records.values()].find((e) => e.threadId === thread.id);

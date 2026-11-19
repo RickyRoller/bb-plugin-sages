@@ -1066,7 +1066,9 @@ export default async function plugin(bb: BbPluginApi) {
       projects.find((each) => each.id === id)?.name ?? id;
     const lanes = await Promise.all(
       envoy.lanes.map(async (lane) => {
-        const status = lane.threadId
+        const status = lane.replacedBy
+          ? `replaced by lane ${lane.replacedBy}`
+          : lane.threadId
           ? await bb.sdk.threads
               .get({ threadId: lane.threadId })
               .then((thread) => (thread.archivedAt ? "archived" : thread.status), () => "unknown")
@@ -1080,7 +1082,7 @@ export default async function plugin(bb: BbPluginApi) {
       `Projects for lanes: ${projects.map((each) => `${each.name} (${each.id})`).join(", ") || "none listed"}`,
       known === null
         ? "Specialists: unavailable right now."
-        : `Specialists your lanes can hand work to: ${known.map((each) => `${each.name} (${each.description || "no description"})`).join("; ") || "none"}`,
+        : `Specialists (lanes hand off their own; use sage_handoff with a lane only when it can't): ${known.map((each) => `${each.name} (${each.description || "no description"})`).join("; ") || "none"}`,
     ];
   }
 
@@ -1832,6 +1834,46 @@ export default async function plugin(bb: BbPluginApi) {
     execute: ({ id, chat }, { threadId }) =>
       toolResult(async () => (await chatOfThread(threadId, chat)).date(id)),
   });
+  /**
+   * An Envoy's chat hands a specialist to one of its lanes: the specialist
+   * is the lane's child, in its worktree, so it shows under the lane and
+   * outlives the chat's turn. bb tells the lane when it finishes, and the
+   * lane's report reaches the chat.
+   */
+  async function laneHandoff(
+    envoyId: string,
+    specialist: string,
+    task: string,
+    which: string | undefined,
+  ): Promise<string> {
+    const envoy = envoys.get(envoyId);
+    if (envoy === null) throw new Error("This Envoy no longer exists");
+    if (which === undefined)
+      throw new Error("Name the lane the specialist works for; the lanes are listed after the view");
+    const key = which.toLowerCase();
+    const lane =
+      envoy.lanes.find((each) => each.id === which) ??
+      envoy.lanes.find((each) => each.replacedBy === null && each.name.toLowerCase() === key);
+    if (!lane?.threadId)
+      throw new Error(`No open lane "${which}"; the lanes are listed after the view`);
+    const { threadId: workerId } = await bb.sdk.plugins.callRpc({
+      pluginId: "specialists",
+      method: "specialists_handoff",
+      input: {
+        specialist,
+        task,
+        projectId: lane.projectId,
+        environmentId: lane.environmentId,
+        parentThreadId: lane.threadId,
+        requestedBy: `The Envoy "${envoy.name}", for its lane "${lane.name}"`,
+      },
+      outputSchema: z.object({ threadId: z.string() }),
+    });
+    return [
+      `Handed off to ${specialist} in thread ${workerId}, under the lane "${lane.name}" (reference it to the user as @thread:${workerId}).`,
+      `The lane hears its result, and its report reaches this chat as a message starting "[lane ${lane.name}]". Do not wait for it or do its work meanwhile.`,
+    ].join("\n");
+  }
   bb.agents.registerTool({
     name: HANDOFF_TOOL,
     description:
@@ -1853,11 +1895,20 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "A self-contained brief: the specialist sees your workspace but none of this chat.",
         ),
+      lane: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "In an Envoy's chat, required: the lane's name or id. The specialist runs as the lane's child, in its worktree, and the lane hears its result.",
+        ),
     }),
-    execute: ({ specialist, task }, { threadId }) =>
+    execute: ({ specialist, task, lane }, { threadId }) =>
       toolResult(async () => {
         const sage = await sageOfTurn(threadId);
         const sageId = sage.id;
+        if (sage.envoyId !== null) return laneHandoff(sage.envoyId, specialist, task, lane);
         const [turn, known] = await Promise.all([
           bb.sdk.threads.get({ threadId }),
           listSpecialists(),
@@ -2124,6 +2175,7 @@ export default async function plugin(bb: BbPluginApi) {
           DATE_TOOL,
           LANE_TOOL,
           LANE_MESSAGE_TOOL,
+          HANDOFF_TOOL,
           ...(envoy?.reportTo ? [REPORT_TOOL] : []),
         ],
         skills: [],

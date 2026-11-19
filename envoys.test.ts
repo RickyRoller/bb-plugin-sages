@@ -1167,6 +1167,59 @@ test("an Envoy with a chat opens lanes; each lane owns its worktree, PR watcher 
   }
 });
 
+test("a broken lane is retried once, then replaced: the new lane takes its PRs and archives it once it reports", async () => {
+  const s = await setup({ chat: true });
+  try {
+    const envoy = await s.create();
+    const turn = { threadId: `turn:${envoy.id}` };
+    await s.harness.behavior.callAgentTool("envoy_open_lane", { name: "Toast fix", task: "Fix the toast" }, turn);
+    const url = "https://github.com/owner/app/pull/7";
+    await s.harness.behavior.callAgentTool("envoy_attach_pr", { url }, { threadId: "thread-1" });
+    const idle = (threadId: string, text: string | null) =>
+      s.harness.behavior.emitThreadEvent("thread.idle", { thread: s.threads.get(threadId)!, lastAssistantText: text } as any);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+    // No reply: the plugin asks the lane once more, and the chat hears nothing.
+    await idle("thread-1", "");
+    await settle();
+    const retry = s.harness.inspection.sdk.callsTo("threads.send").at(-1)![0] as any;
+    assert.equal(retry.threadId, "thread-1");
+    assert.match(retry.input[0].text, /^\[From the Envoy\]\nYour last turn ended without a reply: its turn ended with no reply/);
+    assert.equal(s.chatLog.delivered.length, 0);
+
+    // Stopped by its provider again: the chat hears the lane is broken.
+    await idle("thread-1", "incomplete: content_filter");
+    await settle();
+    assert.equal(s.chatLog.delivered.length, 1);
+    assert.match(s.chatLog.delivered[0]!.report, /^\[lane Toast fix\] broke \(thread thread-1\):\nIt is broken: the provider stopped its turn \(content_filter\), again after one automatic retry/);
+
+    // The replacement may keep the name; it takes the PR and its watcher.
+    assert.match(
+      String(await s.harness.behavior.callAgentTool("envoy_open_lane", { name: "Toast fix", task: "Finish the toast fix", replaces: "Toast fix" }, turn)),
+      /@thread:thread-2/,
+    );
+    const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+    assert.match(spawn.input.at(-1).text, /You take over from the lane "Toast fix" \(thread thread-1\)/);
+    assert.match(spawn.input.at(-1).text, /Its PRs are yours now: https:\/\/github.com\/owner\/app\/pull\/7/);
+    const [old, next] = (await s.harness.behavior.callRpc("envoys_list", null) as any).envoys[0].lanes;
+    assert.equal(old.replacedBy, next.id);
+    assert.deepEqual(old.prs, []);
+    assert.deepEqual(next.prs.map((p: any) => p.url), [url]);
+    assert.deepEqual(s.automations.map((a) => a.createdByThreadId), ["thread-2"]);
+
+    // Messages by name reach the new lane; the old one stays open until the new one reports.
+    await s.harness.behavior.callAgentTool("envoy_message_lane", { lane: "Toast fix", message: "Rebase" }, turn);
+    assert.equal((s.harness.inspection.sdk.callsTo("threads.send").at(-1)![0] as any).threadId, "thread-2");
+    assert.equal(s.threads.get("thread-1")!.archivedAt ?? null, null);
+    await idle("thread-2", "Carried the fix over; PR updated");
+    await settle();
+    assert.notEqual(s.threads.get("thread-1")!.archivedAt ?? null, null);
+    assert.match(s.chatLog.delivered.at(-1)!.report, /^\[lane Toast fix\] report \(thread thread-2\)/);
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
 test("a lane opened without a project goes in the Envoy's default project", async () => {
   const s = await setup({ chat: true });
   try {

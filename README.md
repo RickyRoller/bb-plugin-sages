@@ -152,6 +152,12 @@ per repo or per PR you want reviewed apart, and as many as the work turns out
 to need. It messages a lane with `envoy_message_lane`. When a turn it started
 in a lane ends, the lane's last message comes back to the chat as a new turn.
 If you work in a lane directly, that turn only shows up in the chat's log.
+If a turn the chat started ends with no reply (or its provider stops it, as
+with `incomplete: content_filter`), the lane is asked once more. If it breaks
+again, the chat hears and opens a replacement with `replaces`: the new lane
+takes over the PRs and their watchers, and the old lane is archived once the
+new one reports. When a lane can't hand off a specialist itself, the chat can,
+with `sage_handoff` and the lane's name. The specialist then runs under that lane.
 
 **Lanes.** By default an ordinary BB agent leads each lane (or the specialist
 lead, if you picked one), and it hands work to specialists when their role
