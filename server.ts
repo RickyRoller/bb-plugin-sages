@@ -53,6 +53,8 @@ const sageSchema = z.object({
   turnStart: z.number().nullable().default(null),
   /** Why the latest turn failed, if it did. */
   error: z.string().nullable().default(null),
+  /** Whether a turn ended since the user last had the sage open. */
+  unread: z.boolean().default(false),
   /** The latest turn's selections, to seed the next composer. */
   defaults: z.record(z.string(), z.unknown()).nullable().default(null),
   /**
@@ -209,6 +211,11 @@ export const rpcContract = defineRpcContract({
   sages_reorder: {
     input: z.object({ ids: z.array(z.string()).max(1000) }),
     output: z.object({ ids: z.array(z.string()) }),
+  },
+  /** The user has the sage open: its last turn is read. */
+  sages_seen: {
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.literal(true) }),
   },
   /** Stops the running turn. */
   sages_stop: {
@@ -445,6 +452,7 @@ export default async function plugin(bb: BbPluginApi) {
         const lead = sages.find((each) => each.id === sage.parentId);
         return lead?.envoyInstructions ?? "";
       },
+      hasSage: (sageId) => sages.some((each) => each.id === sageId),
       model: preferences.envoyModel,
     };
   }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text), {
@@ -505,7 +513,15 @@ export default async function plugin(bb: BbPluginApi) {
   /** What the sidebar's Sages section shows, to tell when it needs news. */
   const sidebarView = (list: Sage[]) =>
     JSON.stringify(
-      list.map(({ id, name, parentId, archivedAt }) => [id, name, parentId, archivedAt]),
+      list.map(({ id, name, parentId, archivedAt, running, unread, error }) => [
+        id,
+        name,
+        parentId,
+        archivedAt,
+        running,
+        unread,
+        error !== null,
+      ]),
     );
   async function writeSages(next: Sage[]): Promise<void> {
     const shown = sidebarView(sages);
@@ -1611,6 +1627,7 @@ export default async function plugin(bb: BbPluginApi) {
     follow(thread.id, async (sage) => {
       await updateSage(sage.id, {
         running: false,
+        unread: true,
         // The next turn works where this one did. The environment exists
         // only once the thread has started, so it is read here.
         ...(thread.environmentId == null
@@ -1633,6 +1650,7 @@ export default async function plugin(bb: BbPluginApi) {
     follow(thread.id, (sage) =>
       updateSage(sage.id, {
         running: false,
+        unread: true,
         error: error ?? "The turn failed",
       }),
     ),
@@ -1680,6 +1698,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerSidebarSection(bb, {
     sages: () => sages.filter((each) => each.envoyId === null),
+    chat: (id) => sages.find((each) => each.id === id),
     reorderSages,
     envoys: () => envoys.list(),
     hiddenBadges: () => preferences.hiddenEnvoyBadges,
@@ -1752,6 +1771,10 @@ export default async function plugin(bb: BbPluginApi) {
       return { sage: findSage(id), pending: !done };
     },
     sages_reorder: async ({ ids }) => ({ ids: await reorderSages(ids) }),
+    sages_seen: async ({ id }) => {
+      if (findSage(id).unread) await updateSage(id, { unread: false });
+      return { ok: true as const };
+    },
     sages_stop: async ({ id }) => {
       const { threadId, running } = findSage(id);
       if (!running || threadId === null) return { ok: false };
@@ -2176,7 +2199,9 @@ export default async function plugin(bb: BbPluginApi) {
           LANE_TOOL,
           LANE_MESSAGE_TOOL,
           HANDOFF_TOOL,
-          ...(envoy?.reportTo ? [REPORT_TOOL] : []),
+          ...(envoy?.reportTo && sages.some((each) => each.id === envoy.reportTo!.sageId)
+            ? [REPORT_TOOL]
+            : []),
         ],
         skills: [],
         instructions: envoy ? envoys.chatInstructions(envoy.id) : "",

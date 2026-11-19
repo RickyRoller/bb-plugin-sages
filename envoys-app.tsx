@@ -17,7 +17,9 @@ import {
   type PluginAppBuilder,
   type PluginThreadHeaderActionProps,
   type NewThreadRequest,
+  type NewThreadComposerProps,
 } from "@get-bb/plugin-sdk/app";
+import type { Preferences, rpcContract } from "./server";
 import {
   envoyRpcContract,
   type Envoy,
@@ -66,6 +68,11 @@ function NewEnvoyDialog({
   const [project, setProject] = useState<{ id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const sagesRpc = useRpc<typeof rpcContract>();
+  // undefined while loading, so the composer mounts once with the right seed.
+  const [envoyModel, setEnvoyModel] = useState<
+    Preferences["envoyModel"] | undefined
+  >(undefined);
   const requestId = useRef(crypto.randomUUID());
   useEffect(() => {
     let stale = false;
@@ -80,6 +87,14 @@ function NewEnvoyDialog({
         if (!stale) setError(errorText(cause));
       },
     );
+    sagesRpc.call("sages_preferences").then(
+      (preferences) => {
+        if (!stale) setEnvoyModel(preferences.envoyModel);
+      },
+      () => {
+        if (!stale) setEnvoyModel(null);
+      },
+    );
     rpc.call("envoys_specialists").then(
       (result) => {
         if (!stale) setAvailable(result.specialists);
@@ -89,7 +104,9 @@ function NewEnvoyDialog({
     return () => {
       stale = true;
     };
-  }, [rpc, sdk, initialProject]);
+  }, [rpc, sagesRpc, sdk, initialProject]);
+  // The Envoy model setting seeds the pickers; a lead brings its own defaults instead.
+  const seed = envoyModel && !specialist ? envoyModel : null;
   const submit = async (request: NewThreadRequest) => {
     if (pending) throw new Error("This task is already being created");
     setPending(true);
@@ -175,17 +192,25 @@ function NewEnvoyDialog({
             </select>
           </label>
           <p className="mt-2 text-xs text-muted-foreground">
-            The lead's saved execution defaults apply at launch unless you
-            explicitly select your own provider, model or reasoning level.
-            Changing the lead preserves your composer selections.
+            Without a lead, the composer starts on the Envoy model from
+            settings. With one, the lead's saved defaults apply unless you pick
+            your own provider, model or reasoning level.
           </p>
         </details>
         <ErrorLine error={error} />
-        {project ? (
+        {project && envoyModel !== undefined ? (
           <div className="min-h-64 shrink-0">
             <NewThreadComposer
               draftKey="envoy:new"
               defaultProjectId={project.id}
+              defaultProviderId={seed?.providerId}
+              defaultModel={seed?.model}
+              defaultReasoningLevel={
+                seed?.reasoningLevel as NewThreadComposerProps["defaultReasoningLevel"]
+              }
+              defaultServiceTier={
+                seed?.serviceTier as NewThreadComposerProps["defaultServiceTier"]
+              }
               defaultEnvironment={{
                 type: "host",
                 workspace: {

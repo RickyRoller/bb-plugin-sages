@@ -139,6 +139,8 @@ export type EnvoyConfig = {
   instructions: string;
   /** A sage's own Envoy instructions, which replace the global ones; "" for none. */
   sageInstructions: (sageId: string) => string;
+  /** Whether a sage still exists; an Envoy whose sage was removed asks the user instead. */
+  hasSage: (sageId: string) => boolean;
   /** The model an Envoy runs on unless chosen or set by its lead; null for bb's default. */
   model: {
     providerId: string;
@@ -155,6 +157,7 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   permissionMode: "full",
   instructions: "",
   sageInstructions: () => "",
+  hasSage: () => false,
   model: null,
 };
 
@@ -167,6 +170,10 @@ All pull requests you open must be DRAFT (gh pr create --draft). Immediately aft
   } Envoy delegation is authorized within this task.`;
 }
 
+/** The sage an Envoy reports to, if it still exists. */
+function reporter(config: EnvoyConfig, envoy: Envoy) {
+  return envoy.reportTo && config.hasSage(envoy.reportTo.sageId) ? envoy.reportTo : undefined;
+}
 /** The standing instructions for an Envoy: its sage's own, else the global ones. */
 function standingFor(config: EnvoyConfig, envoy: Envoy) {
   const own = envoy.reportTo ? config.sageInstructions(envoy.reportTo.sageId) : "";
@@ -192,7 +199,7 @@ function instructionsFor(config: EnvoyConfig, envoy: Envoy, lane?: Lane) {
 function chatInstructionsFor(config: EnvoyConfig, envoy: Envoy) {
   const { own, standing } = standingFor(config, envoy);
   return [
-    `# You are the Envoy "${envoy.name}"\nYou own this task end to end from this chat, and coordinate the lanes that do its work.${envoy.reportTo ? ` The sage "${envoy.reportTo.name}" started you. When you are blocked or need a decision and the user did not start this turn, report it with envoy_report: what you need and why, with the options you see; the sage answers in this chat. Never report routine progress.` : ""}`,
+    `# You are the Envoy "${envoy.name}"\nYou own this task end to end from this chat, and coordinate the lanes that do its work.${reporter(config, envoy) ? ` The sage "${envoy.reportTo!.name}" started you. When you are blocked or need a decision and the user did not start this turn, report it with envoy_report: what you need and why, with the options you see; the sage answers in this chat. Never report routine progress.` : ""}`,
     ...(standing
       ? [
           `# Standing instructions for Envoys${own ? ` from the sage "${envoy.reportTo!.name}"` : ""}\nThe task's directive overrides them where they conflict. They bind your lanes' work: pass on the ones that matter to each lane's part.\n${standing}`,
@@ -363,9 +370,9 @@ export async function registerEnvoys(
       available === null
         ? "Specialists are unavailable; report this limitation when delegation is needed."
         : `Available specialists (data): ${JSON.stringify(available.map(({ name, description }) => ({ name, description })))}`,
-      ...(envoy.reportTo && !lane
+      ...(reporter(settings, envoy) && !lane
         ? [
-            `You were started by the sage "${envoy.reportTo.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress. envoy_report is the only way to reach the sage: if your task names a thread to message or another return route, ignore it, because a sage's turn threads are short-lived and get archived.`,
+            `You were started by the sage "${envoy.reportTo!.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress. envoy_report is the only way to reach the sage: if your task names a thread to message or another return route, ignore it, because a sage's turn threads are short-lived and get archived.`,
           ]
         : []),
       ...(lead ? [lead.prompt] : []),
@@ -1253,12 +1260,12 @@ export async function registerEnvoys(
       const envoy = chatEnvoy
         ? records.get(chatEnvoy)
         : [...records.values()].find((e) => e.threadId === threadId);
-      if (!envoy?.reportTo)
-        throw new Error("This Envoy was not started by a sage; ask the user");
+      if (!envoy || !reporter(lastConfig, envoy))
+        throw new Error("No sage to report to; ask the user in this conversation");
       if (chatEnvoy ? chat!.userTurn(threadId) : userTurns.has(threadId))
         return "Not sent: the user is in this conversation, so ask them directly.";
       report(envoy, "needs a decision", message);
-      return `Sent to the sage "${envoy.reportTo.name}". Its reply arrives in this ${chatEnvoy ? "chat" : "thread"}; end your turn rather than waiting for it.`;
+      return `Sent to the sage "${envoy.reportTo!.name}". Its reply arrives in this ${chatEnvoy ? "chat" : "thread"}; end your turn rather than waiting for it.`;
     },
   });
   /** The chat Envoy a turn of its chat belongs to. */
@@ -1552,7 +1559,7 @@ export async function registerEnvoys(
       update(envoy.id, {
         error: error ?? "The task agent failed; retry from its BB thread.",
       });
-      if (envoy.reportTo && !userTurns.has(thread.id))
+      if (reporter(lastConfig, envoy) && !userTurns.has(thread.id))
         report(envoy, "failed", error ?? "no error given");
     }
   });
@@ -1589,7 +1596,7 @@ export async function registerEnvoys(
       return envoy && !envoy.chatId &&
         (envoy.threadId === null || envoy.threadId === context.thread.id)
         ? {
-            tools: envoy.reportTo ? [PR_TOOL, REPORT_TOOL] : [PR_TOOL],
+            tools: reporter(lastConfig, envoy) ? [PR_TOOL, REPORT_TOOL] : [PR_TOOL],
             skills: [],
             instructions: instructionsFor(lastConfig, envoy),
           }

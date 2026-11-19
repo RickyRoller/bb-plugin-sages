@@ -63,10 +63,11 @@ function setup(
   });
   registerSidebarSection(bb, {
     sages: () => [
-      { id: "lead", name: "Web", parentId: null },
-      { id: "open", name: "Search", parentId: "lead", archivedAt: null },
-      { id: "closed", name: "Old", parentId: "lead", archivedAt: "2026-01-01" },
+      { id: "lead", name: "Web", parentId: null, running: true, unread: true, error: null },
+      { id: "open", name: "Search", parentId: "lead", archivedAt: null, running: false, unread: true, error: null },
+      { id: "closed", name: "Old", parentId: "lead", archivedAt: "2026-01-01", running: false, unread: true, error: "boom" },
     ],
+    chat: () => undefined,
     reorderSages: async (ids) => {
       order.push(ids);
       return ids;
@@ -88,6 +89,9 @@ test("sections list sages with open acolytes and claim only the asked Envoy thre
     sages.links.map((l: any) => [l.label, l.children.map((c: any) => c.label)]),
     [["Web", ["Search"]]],
   );
+  // A running turn shows over an unread one; a finished one shows until seen.
+  assert.equal(sages.links[0].status, "working");
+  assert.equal(sages.links[0].children[0].status, "unread");
   assert.deepEqual(envoys.threads.map((t: any) => t.threadId), ["thread-a"]);
   assert.deepEqual(envoys.threads[0].badges[0], {
     label: "[APP-1]",
@@ -207,6 +211,10 @@ test("an Envoy with a chat heads its lanes; each lane gets its own workspace bad
   });
   registerSidebarSection(bb, {
     sages: () => [],
+    chat: (id) =>
+      id === "chat-d"
+        ? { id, name: "d", parentId: null, running: false, unread: true, error: "The turn failed" }
+        : undefined,
     reorderSages: async (ids) => ids,
     envoys: () => [envoy("a", "thread-a"), chat],
     hiddenBadges: () => [],
@@ -224,6 +232,7 @@ test("an Envoy with a chat heads its lanes; each lane gets its own workspace bad
   assert.equal(group.kind, "Envoy");
   assert.equal(group.threadKind, "Lane");
   assert.equal(group.icon, null);
+  assert.equal(group.status, "error");
   assert.deepEqual(group.badges.map((b: any) => b.label), ["[APP-1]"]);
   // Only lanes in the sidebar are listed, each with its own badges.
   assert.deepEqual(group.threads, [

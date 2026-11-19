@@ -821,7 +821,7 @@ function OpenAcolytes({ acolytes }: { acolytes: Sage[] }) {
         >
           <span
             aria-hidden="true"
-            className={`size-1.5 shrink-0 rounded-full ${acolyte.running || acolyte.closing ? "animate-pulse bg-amber-500" : "bg-emerald-500"}`}
+            className={`size-1.5 shrink-0 rounded-full ${acolyte.running || acolyte.closing ? "animate-pulse bg-amber-500" : acolyte.unread ? (acolyte.error === null ? "bg-emerald-500" : "bg-destructive") : "bg-muted-foreground/40"}`}
           />
           <span className="truncate">{acolyte.name}</span>
         </button>
@@ -1280,6 +1280,11 @@ function SageChat({ sageId }: { sageId: string }) {
       ? undefined
       : sages?.find((candidate) => candidate.id === sage.parentId);
   const asking = useAsking(sage?.running ? sage.threadId : null);
+  // The open chat is read: a turn that ends while it is on screen is too.
+  const unread = sage?.unread === true;
+  useEffect(() => {
+    if (unread) rpc.call("sages_seen", { id: sageId }).catch(report);
+  }, [unread, rpc, sageId, report]);
   // An acolyte's way back is its lead; an Envoy's, the Envoys.
   const toList = () =>
     sage?.envoyId != null

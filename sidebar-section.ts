@@ -36,6 +36,8 @@ const linkBase = {
   label: z.string(),
   path: z.string(),
   icon: z.string().nullable(),
+  /** A dot after the label: the linked chat's turn, running or unseen. */
+  status: z.enum(["working", "unread", "error"]).nullable(),
 };
 
 export const sidebarSectionContract = defineRpcContract({
@@ -131,12 +133,30 @@ export const badgeRpcContract = defineRpcContract({
   },
 });
 
-type ListedSage = { id: string; name: string; parentId: string | null; archivedAt?: string | null };
+type ListedSage = {
+  id: string;
+  name: string;
+  parentId: string | null;
+  archivedAt?: string | null;
+  running: boolean;
+  unread: boolean;
+  error: string | null;
+};
+
+/** Working while a turn runs; then unread, or error if it failed, until seen. */
+export function chatStatus(sage: ListedSage | undefined) {
+  if (sage === undefined) return null;
+  if (sage.running) return "working" as const;
+  if (!sage.unread) return null;
+  return sage.error === null ? ("unread" as const) : ("error" as const);
+}
 
 export function registerSidebarSection(
   bb: BbPluginApi,
   deps: {
     sages: () => readonly ListedSage[];
+    /** A chat by its sage id, such as an Envoy's. */
+    chat: (id: string) => ListedSage | undefined;
     reorderSages: (ids: string[]) => Promise<string[]>;
     envoys: () => Iterable<Envoy>;
     hiddenBadges: () => readonly string[];
@@ -292,6 +312,7 @@ export function registerSidebarSection(
           label: sage.name,
           path: `/plugins/sages/sages/${sage.id}`,
           icon,
+          status: chatStatus(sage),
         });
         return {
           sections: [
@@ -326,6 +347,7 @@ export function registerSidebarSection(
                 label: envoy.name,
                 path: `/plugins/sages/sages/${envoy.chatId}`,
                 icon: null,
+                status: envoy.chatId ? chatStatus(deps.chat(envoy.chatId)) : null,
                 kind: "Envoy",
                 threadKind: "Lane",
                 activityAt: activity.get(envoy.id) ?? null,

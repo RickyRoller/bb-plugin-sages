@@ -44,6 +44,8 @@ async function setup(
     issueHosts?: string[];
     instructions?: string;
     sageInstructions?: Record<string, string>;
+    /** Sages that were removed after starting an Envoy. */
+    removedSages?: string[];
     model?: EnvoyConfig["model"];
     /** Plugins listening for lifecycle changes, by plugin id. */
     lifecycleListeners?: Record<string, (input: any) => unknown>;
@@ -216,6 +218,7 @@ async function setup(
     permissionMode: "full",
     instructions: options.instructions ?? "",
     sageInstructions: (sageId) => options.sageInstructions?.[sageId] ?? "",
+    hasSage: (sageId) => !(options.removedSages ?? []).includes(sageId),
     model: options.model ?? null,
   }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }),
   options.chat
@@ -1232,6 +1235,25 @@ test("a lane opened without a project goes in the Envoy's default project", asyn
     assert.match(String(reply), /Opened the lane "Settings page UI" in Example/);
     const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
     assert.equal(spawn.projectId, "project-1");
+  } finally {
+    await s.harness.lifecycle.dispose();
+  }
+});
+
+test("an Envoy whose sage was removed asks the user instead of reporting", async () => {
+  const s = await setup({ chat: true, removedSages: ["sage-1"] });
+  try {
+    const envoy = await s.helpers.createTask({
+      task: "Fix the search filter",
+      projectId: "project-1",
+      reportTo: { sageId: "sage-1", name: "Planner" },
+    });
+    await assert.rejects(
+      s.harness.behavior.callAgentTool("envoy_report", { message: "Which repo?" }, { threadId: `turn:${envoy.id}` }),
+      /ask the user/,
+    );
+    assert.equal(s.reports.length, 0);
+    assert.doesNotMatch(s.helpers.chatInstructions(envoy.id), /Planner/);
   } finally {
     await s.harness.lifecycle.dispose();
   }
