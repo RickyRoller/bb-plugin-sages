@@ -71,7 +71,7 @@ Sages works on its own. These other plugins and tools add features:
 
 | Needs | For |
 | --- | --- |
-| Specialists plugin | `sage_handoff`, Envoy specialist leads, and the ready-PR handoff |
+| Specialists plugin | `sage_handoff` and the ready-PR handoff |
 | Sidebar Thread Details plugin | The Sages and Envoys sections in the sidebar |
 | Automations plugin and `gh` | PR watchers for Envoys |
 | Worktree plugin | Envoys in prepared projects |
@@ -101,7 +101,7 @@ A sage has these tools:
   when you ask for one.
 - `sage_message_acolyte(acolyte, message, round?)` sends an acolyte work or a
   question.
-- `sage_envoy(task, project?, name?, issueUrl?, specialist?, requestId?)`
+- `sage_envoy(task, project?, name?, issueUrl?, requestId?)`
   starts an Envoy. A sage only uses it when you ask it to.
 
 Type `@` in any composer to mention a sage. The agent then knows which sage
@@ -133,8 +133,9 @@ knows. Acolytes cannot have acolytes.
 
 Start one from **Sages → Envoys → New Envoy**, from the **New Envoy** command
 palette action, from the CLI, or by asking a sage. Describe the task. You can
-also give a name, an issue link and a specialist lead. BB's composer picks the
-default project, model and permissions.
+also give a name and an issue link. BB's composer picks the default project,
+model and permissions. Settings has a model for the Envoy's chat and one for
+its lanes, which fall back to the chat's.
 
 **Three levels.** In the sidebar's Envoys section:
 
@@ -159,9 +160,8 @@ takes over the PRs and their watchers, and the old lane is archived once the
 new one reports. When a lane can't hand off a specialist itself, the chat can,
 with `sage_handoff` and the lane's name. The specialist then runs under that lane.
 
-**Lanes.** By default an ordinary BB agent leads each lane (or the specialist
-lead, if you picked one), and it hands work to specialists when their role
-fits. A lane opens PRs as drafts and attaches them with `envoy_attach_pr` (or
+**Lanes.** An ordinary BB agent runs each lane, and it hands work to
+specialists when their role fits. A lane opens PRs as drafts and attaches them with `envoy_attach_pr` (or
 you attach them in the details dialog). The lane owns each PR to the end.
 
 Envoys started before lanes existed are one thread each and keep working as

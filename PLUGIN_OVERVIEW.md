@@ -30,7 +30,7 @@ CLIs; other providers, and BB's default, run in short-lived hidden BB threads.
 ## Envoys for bounded tasks
 
 Start an Envoy for a bug, issue or feature, even one across repos. It gets an
-endless chat of its own, with an optional name, issue link and specialist lead.
+endless chat of its own, with an optional name and issue link.
 The chat coordinates lanes: visible threads, each in a fresh worktree from a
 project's default branch, one per repo or PR. Each lane opens draft PRs and owns
 them end to end, with its specialists as child threads. If you name a ready-PR

@@ -136,8 +136,10 @@ const summaryModelSchema = z
 /** Choices made with bb's own pickers, so they follow what bb has set up. */
 const preferencesSchema = z.object({
   summaryModel: summaryModelSchema.default(null),
-  /** The model Envoys run on unless chosen or set by a lead; null for bb's default. */
+  /** The model an Envoy's chat runs on unless chosen in the composer; null for bb's default. */
   envoyModel: summaryModelSchema.default(null),
+  /** The model Envoy lanes run on; null for the Envoy's own model. */
+  laneModel: summaryModelSchema.default(null),
   /** The specialist started when an Envoy's attached PR is ready; "" for none. */
   readyHandoffSpecialist: z.string().default(""),
   /** Envoy badge sources left off sidebar rows: "issue" or a plugin id. */
@@ -155,6 +157,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       summaryModel: summaryModelSchema.optional(),
       envoyModel: summaryModelSchema.optional(),
+      laneModel: summaryModelSchema.optional(),
       readyHandoffSpecialist: z.string().optional(),
       hiddenEnvoyBadges: z.array(z.string().max(200)).max(100).optional(),
     }),
@@ -454,6 +457,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       hasSage: (sageId) => sages.some((each) => each.id === sageId),
       model: preferences.envoyModel,
+      laneModel: preferences.laneModel,
     };
   }, (envoy, outcome, text) => reportEnvoy(envoy, outcome, text), {
     open: (envoy, launch) => openEnvoyChat(envoy, launch),
@@ -589,7 +593,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function openEnvoyChat(
     envoy: Envoy,
-    launch: { request: { input: readonly unknown[] }; lead: unknown },
+    launch: { request: { input: readonly unknown[] } },
   ): Promise<string> {
     const existing = sages.find((each) => each.envoyId === envoy.id);
     if (existing) return existing.id;
@@ -1093,7 +1097,7 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     );
     return [
-      `Envoy "${envoy.name}" (${envoy.id}): ${envoy.lifecycle}${envoy.issue ? `; issue ${envoy.issue.key} ${envoy.issue.url}` : ""}; default project ${projectName(envoy.projectId)}${envoy.specialist ? `; its lanes are led by the ${envoy.specialist} specialist` : ""}.`,
+      `Envoy "${envoy.name}" (${envoy.id}): ${envoy.lifecycle}${envoy.issue ? `; issue ${envoy.issue.key} ${envoy.issue.url}` : ""}; default project ${projectName(envoy.projectId)}.`,
       lanes.length ? ["Your lanes:", ...lanes].join("\n") : "Your lanes: none yet.",
       `Projects for lanes: ${projects.map((each) => `${each.name} (${each.id})`).join(", ") || "none listed"}`,
       known === null
@@ -2134,11 +2138,6 @@ export default async function plugin(bb: BbPluginApi) {
           "A few words naming the task. Leave out the issue key: the issue link is shown beside the name",
         ),
       issueUrl: z.string().trim().max(2000).optional().describe("A full https issue link"),
-      specialist: z
-        .string()
-        .trim()
-        .optional()
-        .describe("A specialist to lead it, from the list after the view"),
       requestId: z
         .string()
         .trim()
@@ -2146,7 +2145,7 @@ export default async function plugin(bb: BbPluginApi) {
         .optional()
         .describe("Reuse to make a retried call return the same Envoy"),
     }),
-    execute: ({ task, project, name, issueUrl, specialist, requestId }, { threadId }) =>
+    execute: ({ task, project, name, issueUrl, requestId }, { threadId }) =>
       toolResult(async () => {
         let projectId = (await bb.sdk.threads.get({ threadId })).projectId;
         if (project) {
@@ -2168,7 +2167,6 @@ export default async function plugin(bb: BbPluginApi) {
           projectId,
           name,
           issueUrl,
-          specialist,
           requestId,
         });
         return [

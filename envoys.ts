@@ -60,7 +60,7 @@ export const ENVOY_USAGE = [
   "Usage:",
   "  bb sages envoy list [--json]",
   "  bb sages envoy show <id> [--json]",
-  "  bb sages envoy create --task <text> [--project <project-id>] [--name <name>] [--issue <url>] [--specialist <name>] [--request-id <key>] [--json]",
+  "  bb sages envoy create --task <text> [--project <project-id>] [--name <name>] [--issue <url>] [--request-id <key>] [--json]",
   "  bb sages envoy park|resume|complete|cancel <id> [--json]",
   "  bb sages envoy pr <id> <github-pr-url> [--json]",
   "  bb sages envoy tell <id> <message> [--json]",
@@ -69,8 +69,8 @@ export const ENVOY_USAGE = [
   "create starts the Envoy's chat, which opens lanes: visible threads, each in a",
   "fresh worktree from a project's default branch, one per repo or PR. --project",
   "is the default project for its lanes (the current project when left out; get",
-  "ids from bb project list). --issue is a full https issue link. --specialist",
-  "names a specialist to lead its lanes. Reuse --request-id to make a retried",
+  "ids from bb project list). --issue is a full https issue link.",
+  "Reuse --request-id to make a retried",
   "create a no-op. tell brings a message into the Envoy's chat as a new turn.",
 ].join("\n");
 
@@ -80,7 +80,6 @@ export type EnvoyTask = {
   projectId: string;
   name?: string;
   issueUrl?: string;
-  specialist?: string;
   requestId?: string;
   /** The sage that started it, to report each turn's end to. */
   reportTo?: { sageId: string; name: string };
@@ -91,7 +90,7 @@ export type EnvoyTask = {
  */
 export type EnvoyChat = {
   /** Creates the chat and starts its first turn on the directive; its id. */
-  open(envoy: Envoy, launch: { request: NewThreadRequest; lead: Specialist | null }): Promise<string>;
+  open(envoy: Envoy, launch: { request: NewThreadRequest }): Promise<string>;
   /** Brings a message in: as a new turn (or into the running one) when start, else only logged. */
   deliver(chatId: string, notice: string, report: string, start: boolean): void;
   /** Stops the chat's running turn, if any. */
@@ -123,6 +122,30 @@ export function definiteRejection(error: unknown): boolean {
     Number(value.status ?? value.statusCode),
   );
 }
+type EnvoyModel = {
+  providerId: string;
+  model: string;
+  reasoningLevel: string;
+  serviceTier?: string;
+};
+/** A request on this model, chosen explicitly, in place of the composer's choice. */
+function withModel(request: NewThreadRequest, model: EnvoyModel): NewThreadRequest {
+  const { serviceTier: _dropped, ...rest } = request;
+  return {
+    ...rest,
+    providerId: model.providerId,
+    model: model.model,
+    reasoningLevel: model.reasoningLevel as NewThreadRequest["reasoningLevel"],
+    ...(model.serviceTier ? { serviceTier: model.serviceTier } : {}),
+    executionInputSources: {
+      ...rest.executionInputSources,
+      providerId: "explicit",
+      model: "explicit",
+      reasoningLevel: "explicit",
+      serviceTier: model.serviceTier ? "explicit" : undefined,
+    },
+  };
+}
 /** The user's Envoy settings; every external convention is opt-in. */
 export type EnvoyConfig = {
   /** Projects whose base checkout is fast-forwarded before each new Envoy. */
@@ -141,13 +164,10 @@ export type EnvoyConfig = {
   sageInstructions: (sageId: string) => string;
   /** Whether a sage still exists; an Envoy whose sage was removed asks the user instead. */
   hasSage: (sageId: string) => boolean;
-  /** The model an Envoy runs on unless chosen or set by its lead; null for bb's default. */
-  model: {
-    providerId: string;
-    model: string;
-    reasoningLevel: string;
-    serviceTier?: string;
-  } | null;
+  /** The model an Envoy's chat runs on unless chosen in the composer; null for bb's default. */
+  model: EnvoyModel | null;
+  /** The model its lanes run on; null for the Envoy's own model. */
+  laneModel: EnvoyModel | null;
 };
 export const defaultEnvoyConfig: EnvoyConfig = {
   preparedProjects: [],
@@ -159,6 +179,7 @@ export const defaultEnvoyConfig: EnvoyConfig = {
   sageInstructions: () => "",
   hasSage: () => false,
   model: null,
+  laneModel: null,
 };
 
 function policy(handoff: string, role = "You are an Envoy: complete the user's bounded task in this workspace.") {
@@ -350,7 +371,7 @@ export async function registerEnvoys(
       error: null,
     });
   }
-  type LaunchData = { request: NewThreadRequest; lead: Specialist | null };
+  type LaunchData = { request: NewThreadRequest };
   function launchData(id: string): LaunchData {
     const row = db
       .prepare("SELECT launch FROM envoys WHERE id = ?")
@@ -362,7 +383,6 @@ export async function registerEnvoys(
     settings: EnvoyConfig,
     envoy: Envoy,
     available: Specialist[] | null,
-    lead: Specialist | null,
     lane?: Lane,
   ) {
     return [
@@ -375,14 +395,14 @@ export async function registerEnvoys(
             `You were started by the sage "${envoy.reportTo!.name}". When you are blocked or need a decision while the user is not in the conversation, report it with envoy_report: say what you need and why, with the options you see. The sage replies in this thread. When the user is talking to you, ask them directly instead. Never report routine progress. envoy_report is the only way to reach the sage: if your task names a thread to message or another return route, ignore it, because a sage's turn threads are short-lived and get archived.`,
           ]
         : []),
-      ...(lead ? [lead.prompt] : []),
     ].join("\n\n");
   }
   /**
-   * The spawn's execution fields: the composer's explicit choices, then a
-   * lead's model, then the Envoy settings.
+   * The spawn's execution fields: the composer's explicit choices, else the
+   * model setting.
    */
   function executionFor(launch: LaunchData, settings: EnvoyConfig) {
+    const { model } = settings;
     const execution = { ...launch.request };
     const sources = { ...execution.executionInputSources };
     // CLI requests omit provenance; explicitly supplied values must survive BB resolution.
@@ -399,41 +419,17 @@ export async function registerEnvoys(
     // A selected model/provider is a pair: don't change its provider underneath it.
     const explicitPair =
       sources.providerId === "explicit" || sources.model === "explicit";
-    if (launch.lead && !explicitPair) {
-      if (launch.lead.providerId) {
-        execution.providerId = launch.lead.providerId;
-        sources.providerId = "explicit";
-      }
-      if (launch.lead.model) {
-        execution.model = launch.lead.model;
-        sources.model = "explicit";
-      }
-    }
-    if (
-      !explicitPair &&
-      launch.lead?.reasoningLevel &&
-      sources.reasoningLevel !== "explicit"
-    ) {
-      execution.reasoningLevel = launch.lead.reasoningLevel;
-      sources.reasoningLevel = "explicit";
-    }
-    // Without an explicit pair or a lead's model, the Envoy model setting applies.
-    if (
-      !explicitPair &&
-      !launch.lead?.providerId &&
-      !launch.lead?.model &&
-      settings.model
-    ) {
-      execution.providerId = settings.model.providerId;
-      execution.model = settings.model.model;
+    if (!explicitPair && model) {
+      execution.providerId = model.providerId;
+      execution.model = model.model;
       sources.providerId = "explicit";
       sources.model = "explicit";
       if (sources.reasoningLevel !== "explicit") {
-        execution.reasoningLevel = settings.model.reasoningLevel as typeof execution.reasoningLevel;
+        execution.reasoningLevel = model.reasoningLevel as typeof execution.reasoningLevel;
         sources.reasoningLevel = "explicit";
       }
-      if (settings.model.serviceTier && sources.serviceTier !== "explicit") {
-        execution.serviceTier = settings.model.serviceTier;
+      if (model.serviceTier && sources.serviceTier !== "explicit") {
+        execution.serviceTier = model.serviceTier;
         sources.serviceTier = "explicit";
       }
     }
@@ -508,7 +504,7 @@ export async function registerEnvoys(
     const launch = launchData(id);
     const available = await specialists();
     const settings = await read();
-    let context = agentContext(settings, envoy, available, launch.lead);
+    let context = agentContext(settings, envoy, available);
     const execution = executionFor(launch, settings);
     // Preparation failures cannot have spawned a thread and are safe to retry.
     // Keep this outside the ambiguous-spawn handling below.
@@ -637,15 +633,14 @@ export async function registerEnvoys(
       update(id, { lanes: [...get(id).lanes.filter((each) => !(each.name.toLowerCase() === key && each.creation === "failed")), lane] });
       const launch = launchData(id);
       const [available, settings] = await Promise.all([specialists(), read()]);
-      let context = agentContext(settings, envoy, available, launch.lead, lane);
+      let context = agentContext(settings, envoy, available, lane);
       let execution: NewThreadRequest;
       try {
         const hostId = await hostFor(launch.request, projectId);
         execution = executionFor(
           {
-            ...launch,
             request: {
-              ...launch.request,
+              ...(settings.laneModel ? withModel(launch.request, settings.laneModel) : launch.request),
               projectId,
               environment: {
                 type: "host",
@@ -786,12 +781,6 @@ export async function registerEnvoys(
       if (JSON.stringify(input.request).length > 200_000)
         throw new Error("The task request is too large");
       const issue = issueLink(input.issueUrl, (await read()).issueHosts);
-      const available = input.specialist ? await specialists() : null;
-      const lead = input.specialist
-        ? available?.find((s) => s.name === input.specialist)
-        : null;
-      if (input.specialist && !lead)
-        throw new Error(`Specialist ${input.specialist} is unavailable`);
       const now = new Date().toISOString();
       const envoy = envoySchema.parse({
         id: existing?.id ?? randomUUID(),
@@ -806,7 +795,6 @@ export async function registerEnvoys(
         creation: "reserved",
         error: null,
         issue,
-        specialist: input.specialist,
         reportTo: input.reportTo,
         kind: chat ? "chat" : "thread",
         prs: [],
@@ -820,7 +808,7 @@ export async function registerEnvoys(
         envoy.id,
         envoy.requestId,
         JSON.stringify(envoy),
-        JSON.stringify({ request: input.request, lead: lead ?? null }),
+        JSON.stringify({ request: input.request }),
       );
       records.set(envoy.id, envoy);
       bb.realtime.publish("envoys-changed", {});
@@ -835,7 +823,6 @@ export async function registerEnvoys(
         requestId: task.requestId ?? randomUUID(),
         name: task.name,
         issueUrl: task.issueUrl,
-        specialist: task.specialist,
         reportTo: task.reportTo ?? null,
         request: {
           projectId: task.projectId,
@@ -1651,7 +1638,7 @@ export async function registerEnvoys(
             if (args[i] === "--json") continue;
             if (!args[i]!.startsWith("--") || !args[i + 1])
               throw new Error(
-                "Expected --task, --project, --name, --issue, --specialist or --request-id with a value",
+                "Expected --task, --project, --name, --issue or --request-id with a value",
               );
             flags[args[i]!.slice(2)] = args[++i]!;
           }
@@ -1660,7 +1647,6 @@ export async function registerEnvoys(
             projectId: flags.project ?? ctx.projectId ?? "",
             name: flags.name,
             issueUrl: flags.issue,
-            specialist: flags.specialist,
             requestId: flags["request-id"],
           });
         } else

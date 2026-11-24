@@ -23,7 +23,6 @@ const envoy = (id: string, threadId: string | null, issue = true): Envoy =>
     issue: issue
       ? { key: "APP-1", url: "https://linear.app/acme/issue/APP-1" }
       : null,
-    specialist: null,
     prs: [],
     result: null,
     createdAt: "2026-10-26T00:00:00Z",

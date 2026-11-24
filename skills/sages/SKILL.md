@@ -71,7 +71,7 @@ with Envoy creation.
   when the user asks to steer that lane.
 - `bb sages envoy create --project <project-id> --task <directive>` starts the
   Envoy's chat; `--project` is the default project for its lanes. Optional: `--name`, `--issue` (full https issue URL),
-  `--specialist` (lead preset), `--request-id` (reuse for deduplication).
+  `--request-id` (reuse for deduplication).
   Prefer the New Envoy UI when machine/model/permissions need selection.
 - `bb sages envoy park|resume|complete|cancel <id>` manages task lifecycle. Park
   preserves workspace/chat and PR follow-up. Complete preserves PR follow-up;
@@ -93,7 +93,7 @@ cause and `recover`. Do not reset/stash the source or bypass preparation. New wo
 still need their own dependencies: follow repository setup instructions and the
 Envoy's launch instructions before editing or validating. Other projects use native BB setup.
 
-Use specialists for appropriate work; a specialist lead is optional. All new PRs
+Use specialists for appropriate work. All new PRs
 must open as drafts. Never mark ready without the user's explicit request. The Envoy
 owns its PR end to end: when a Ready-PR handoff specialist is chosen in the Sages
 settings, attaching a PR creates a watcher automation owned by the Envoy

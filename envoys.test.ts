@@ -21,7 +21,6 @@ const request = {
   requestId: "request-1",
   name: "",
   issueUrl: "https://tracker.example.com/team/issue/ABC-123/fix",
-  specialist: null,
   request: {
     projectId: "project-1",
     environment: {
@@ -38,7 +37,6 @@ async function setup(
     missingSpecialist?: boolean;
     spawnError?: unknown;
     hostError?: boolean;
-    lead?: boolean;
     prepare?: boolean;
     noHandoff?: boolean;
     issueHosts?: string[];
@@ -47,6 +45,7 @@ async function setup(
     /** Sages that were removed after starting an Envoy. */
     removedSages?: string[];
     model?: EnvoyConfig["model"];
+    laneModel?: EnvoyConfig["laneModel"];
     /** Plugins listening for lifecycle changes, by plugin id. */
     lifecycleListeners?: Record<string, (input: any) => unknown>;
     /** Envoys get a chat (this fake) and work in lanes. */
@@ -170,16 +169,7 @@ async function setup(
             return {
               specialists: options.missingSpecialist
                 ? []
-                : [
-                    options.lead
-                      ? {
-                          ...specialist,
-                          providerId: "claude-code",
-                          model: "lead-model",
-                          reasoningLevel: "high",
-                        }
-                      : specialist,
-                  ],
+                : [specialist],
             };
           if (args.pluginId === "automations") {
             const input = args.input as any;
@@ -220,6 +210,7 @@ async function setup(
     sageInstructions: (sageId) => options.sageInstructions?.[sageId] ?? "",
     hasSage: (sageId) => !(options.removedSages ?? []).includes(sageId),
     model: options.model ?? null,
+    laneModel: options.laneModel ?? null,
   }), (envoy, outcome, text) => reports.push({ name: envoy.name, outcome, text }),
   options.chat
     ? {
@@ -307,14 +298,13 @@ test("without a ready-PR handoff, attached PRs are recorded but never watched", 
   }
 });
 
-test("ordinary lead, generated name, stable visible thread, preserved permissions and double-submit dedup", async () => {
+test("generated name, stable visible thread, preserved permissions and double-submit dedup", async () => {
   const s = await setup();
   try {
     const [a, b] = await Promise.all([s.create(), s.create()]);
     assert.equal(a.id, b.id);
     assert.equal(s.counts().spawnCount, 1);
     assert.equal(a.name, "Fix login crash");
-    assert.equal(a.specialist, null);
     const spawn = s.harness.inspection.sdk.callsTo(
       "threads.spawn",
     )[0]![0] as any;
@@ -630,47 +620,39 @@ test("parked and completed Envoys refuse automated messages; a user message resu
   }
 });
 
-test("lead defaults apply with provenance, while explicit selections and workspace/permissions survive", async () => {
-  const s = await setup({ lead: true });
+test("explicit selections, workspace and permissions survive", async () => {
+  const s = await setup({ model: { providerId: "claude-code", model: "envoy-model", reasoningLevel: "high" } });
   try {
-    for (const explicit of [false, true]) {
-      await s.harness.behavior.callRpc("envoys_create", {
-        ...request,
-        requestId: `lead-${explicit}`,
-        specialist: "ready-pr",
-        request: {
-          ...request.request,
-          providerId: "codex",
-          model: "user-model",
-          reasoningLevel: "low",
-          permissionMode: "full",
-          executionInputSources: {
-            providerId: explicit ? "explicit" : "client-preference",
-            model: explicit ? "explicit" : "client-preference",
-            reasoningLevel: "client-preference",
-            permissionMode: "explicit",
-          },
-          environment: {
-            type: "host",
-            hostId: "my-host",
-            workspace: { type: "unmanaged", path: "/chosen/workspace" },
-          },
+    await s.harness.behavior.callRpc("envoys_create", {
+      ...request,
+      request: {
+        ...request.request,
+        providerId: "codex",
+        model: "user-model",
+        reasoningLevel: "low",
+        permissionMode: "full",
+        executionInputSources: {
+          providerId: "explicit",
+          model: "explicit",
+          reasoningLevel: "explicit",
+          permissionMode: "explicit",
         },
-      });
-      const args = s.harness.inspection.sdk
-        .callsTo("threads.spawn")
-        .at(-1)![0] as any;
-      assert.equal(args.model, explicit ? "user-model" : "lead-model");
-      assert.equal(args.providerId, explicit ? "codex" : "claude-code");
-      assert.equal(args.reasoningLevel, explicit ? "low" : "high");
-      assert.equal(args.permissionMode, "full");
-      assert.deepEqual(args.environment, {
-        type: "host",
-        hostId: "my-host",
-        workspace: { type: "unmanaged", path: "/chosen/workspace" },
-      });
-      assert.equal(args.executionInputSources.model, "explicit");
-    }
+        environment: {
+          type: "host",
+          hostId: "my-host",
+          workspace: { type: "unmanaged", path: "/chosen/workspace" },
+        },
+      },
+    });
+    const args = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+    assert.deepEqual([args.providerId, args.model, args.reasoningLevel], ["codex", "user-model", "low"]);
+    assert.equal(args.permissionMode, "full");
+    assert.deepEqual(args.environment, {
+      type: "host",
+      hostId: "my-host",
+      workspace: { type: "unmanaged", path: "/chosen/workspace" },
+    });
+    assert.equal(args.executionInputSources.model, "explicit");
   } finally {
     await s.harness.lifecycle.dispose();
   }
@@ -878,7 +860,7 @@ test("a sage's Envoy instructions replace the global ones for Envoys it starts",
   }
 });
 
-test("the Envoy model setting applies unless the composer or a lead chose a model", async () => {
+test("the Envoy model setting applies unless the composer chose a model", async () => {
   const model = { providerId: "claude-code", model: "envoy-model", reasoningLevel: "medium" };
   const s = await setup({ model });
   try {
@@ -903,20 +885,6 @@ test("the Envoy model setting applies unless the composer or a lead chose a mode
     assert.equal(spawns[0].reasoningLevel, "medium");
   } finally {
     await s.harness.lifecycle.dispose();
-  }
-  const led = await setup({ lead: true, model });
-  try {
-    await led.helpers.createTask({
-      task: "Led",
-      projectId: "project-1",
-      specialist: "ready-pr",
-    });
-    const args = led.harness.inspection.sdk
-      .callsTo("threads.spawn")
-      .at(-1)![0] as any;
-    assert.equal(args.model, "lead-model");
-  } finally {
-    await led.harness.lifecycle.dispose();
   }
 });
 
@@ -1237,6 +1205,38 @@ test("a lane opened without a project goes in the Envoy's default project", asyn
     assert.equal(spawn.projectId, "project-1");
   } finally {
     await s.harness.lifecycle.dispose();
+  }
+});
+
+test("lanes run on the lane model setting, else on the Envoy's model", async () => {
+  const model = { providerId: "codex", model: "envoy-model", reasoningLevel: "medium" };
+  const laneModel = { providerId: "acp-omp", model: "lane-model", reasoningLevel: "high" };
+  for (const [lanes, expected] of [
+    [laneModel, ["acp-omp", "lane-model", "high"]],
+    [null, ["codex", "user-model", "low"]],
+  ] as const) {
+    const s = await setup({ chat: true, model, laneModel: lanes });
+    try {
+      const envoy = await s.harness.behavior.callRpc("envoys_create", {
+        ...request,
+        request: {
+          ...request.request,
+          providerId: "codex",
+          model: "user-model",
+          reasoningLevel: "low",
+          executionInputSources: { providerId: "explicit", model: "explicit", reasoningLevel: "explicit" },
+        },
+      }) as any;
+      await s.harness.behavior.callAgentTool(
+        "envoy_open_lane",
+        { name: "Settings page UI", task: "Build the settings page" },
+        { threadId: `turn:${envoy.id}` },
+      );
+      const spawn = s.harness.inspection.sdk.callsTo("threads.spawn").at(-1)![0] as any;
+      assert.deepEqual([spawn.providerId, spawn.model, spawn.reasoningLevel], expected);
+    } finally {
+      await s.harness.lifecycle.dispose();
+    }
   }
 });
 

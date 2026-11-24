@@ -53,7 +53,6 @@ const envoy = {
   creation: "ready",
   error: null,
   issue: { key: "ABC-123", url: "https://tracker.example.com/issue/ABC-123" },
-  specialist: null,
   prs: [],
   chatId: null,
   lanes: [],
@@ -99,7 +98,7 @@ const sdk = {
   },
 };
 
-test("creation dialog defaults to an ordinary agent, worktree, optional name/issue and navigates to stable task thread", async () => {
+test("creation dialog defaults to a worktree, optional name/issue and navigates to stable task thread", async () => {
   let submitted;
   const slot = renderSlot(
     app.appOverlays[0],
@@ -131,7 +130,7 @@ test("creation dialog defaults to an ordinary agent, worktree, optional name/iss
       JSON.parse(composer.dataset.defaultEnvironment).workspace.type,
       "managed-worktree",
     );
-    assert.equal(document.querySelector("select").value, "");
+    assert.equal(document.querySelector("select"), null);
     const task = document.querySelector(
       '[data-testid="bb-new-thread-composer-input"]',
     );
@@ -143,7 +142,7 @@ test("creation dialog defaults to an ordinary agent, worktree, optional name/iss
     fireEvent.click(
       document.querySelector('[data-testid="bb-new-thread-composer-submit"]'),
     );
-    await waitFor(() => assert.equal(submitted?.specialist, null));
+    await waitFor(() => assert.ok(submitted));
     assert.equal(submitted.name, "");
     assert.equal(submitted.issueUrl, envoy.issue.url);
     await waitFor(() =>
@@ -216,58 +215,6 @@ test("chat header exposes task details and attaches a PR without making it ready
     assert.ok(
       !slot.inspection.rpcCalls.some((call) => call.method.includes("ready")),
     );
-  } finally {
-    slot.lifecycle.unmount();
-  }
-});
-
-test("changing a specialist lead never changes the mounted composer's seeds or task draft", async () => {
-  const slot = renderSlot(
-    app.appOverlays[0],
-    {},
-    {
-      sdk,
-      rpc: {
-        envoys_specialists: () => ({
-          specialists: [
-            {
-              name: "reviewer",
-              description: "Review",
-              prompt: "Review",
-              providerId: "claude-code",
-              model: "lead-model",
-              reasoningLevel: "high",
-            },
-          ],
-          available: true,
-        }),
-      },
-    },
-  );
-  try {
-    await act(async () => openNewEnvoy("project-1"));
-    await waitFor(() =>
-      assert.ok(
-        document.querySelector('[data-testid="bb-new-thread-composer"]'),
-      ),
-    );
-    const composer = document.querySelector(
-      '[data-testid="bb-new-thread-composer"]',
-    );
-    const before = { ...composer.dataset };
-    const task = document.querySelector(
-      '[data-testid="bb-new-thread-composer-input"]',
-    );
-    fireEvent.change(task, { target: { value: "Keep this task" } });
-    fireEvent.change(document.querySelector("select"), {
-      target: { value: "reviewer" },
-    });
-    assert.deepEqual({ ...composer.dataset }, before);
-    assert.equal(task.value, "Keep this task");
-    fireEvent.change(document.querySelector("select"), {
-      target: { value: "" },
-    });
-    assert.deepEqual({ ...composer.dataset }, before);
   } finally {
     slot.lifecycle.unmount();
   }

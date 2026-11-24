@@ -105,7 +105,6 @@ export const envoySchema = z.object({
   creation: z.enum(["reserved", "launching", "ready", "failed", "uncertain"]),
   error: z.string().nullable(),
   issue: issueSchema.nullable(),
-  specialist: z.string().nullable(),
   /** The sage that started it, which hears how each of its turns ends. */
   reportTo: z
     .object({ sageId: z.string(), name: z.string() })
@@ -176,7 +175,6 @@ export const createSchema = z.object({
   requestId: z.string().min(1).max(100),
   name: z.string().trim().max(80).default(""),
   issueUrl: z.string().trim().max(2000).default(""),
-  specialist: z.string().nullable().default(null),
   reportTo: envoySchema.shape.reportTo,
   request: requestSchema,
 });

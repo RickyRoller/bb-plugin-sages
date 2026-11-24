@@ -70,6 +70,7 @@ function SagesSettings() {
     return <p className="text-sm text-muted-foreground">{error ?? "Loading…"}</p>;
   const summaryModel = (preferences.summaryModel as PickerValue | null) ?? fallback;
   const envoyModel = (preferences.envoyModel as PickerValue | null) ?? fallback;
+  const laneModel = (preferences.laneModel as PickerValue | null) ?? fallback;
   const handoff = preferences.readyHandoffSpecialist;
   return (
     <div className="flex flex-col gap-5">
@@ -105,8 +106,7 @@ function SagesSettings() {
       <div className="space-y-2">
         <p className="text-sm font-medium">Envoy model</p>
         <p className="text-xs text-muted-foreground">
-          Runs new Envoys unless the composer picks a model or a lead
-          specialist sets one.{" "}
+          Runs each new Envoy's chat unless the composer picks a model.{" "}
           {preferences.envoyModel === null
             ? "Using bb's default model until you pick one."
             : ""}
@@ -127,6 +127,34 @@ function SagesSettings() {
               onClick={() => void save({ envoyModel: null })}
             >
               Use bb's default
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <div className="space-y-2">
+        <p className="text-sm font-medium">Envoy lane model</p>
+        <p className="text-xs text-muted-foreground">
+          Runs the lanes, which write the code.{" "}
+          {preferences.laneModel === null
+            ? "Using each Envoy's own model until you pick one."
+            : ""}
+        </p>
+        <div className="flex items-center gap-2">
+          {laneModel ? (
+            <ProviderModelPicker
+              value={laneModel}
+              onChange={(value) => void save({ laneModel: value })}
+            />
+          ) : (
+            <span className="text-sm text-muted-foreground">Each Envoy's model</span>
+          )}
+          {preferences.laneModel !== null ? (
+            <Button
+              variant="ghost"
+              className="h-8 text-xs"
+              onClick={() => void save({ laneModel: null })}
+            >
+              Use each Envoy's model
             </Button>
           ) : null}
         </div>

@@ -24,7 +24,6 @@ import {
   envoyRpcContract,
   type Envoy,
   type Lane,
-  type Specialist,
 } from "./envoy-contract";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -63,8 +62,6 @@ function NewEnvoyDialog({
   const navigate = useBbNavigate();
   const [name, setName] = useState("");
   const [issueUrl, setIssueUrl] = useState("");
-  const [specialist, setSpecialist] = useState("");
-  const [available, setAvailable] = useState<Specialist[]>([]);
   const [project, setProject] = useState<{ id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -95,18 +92,12 @@ function NewEnvoyDialog({
         if (!stale) setEnvoyModel(null);
       },
     );
-    rpc.call("envoys_specialists").then(
-      (result) => {
-        if (!stale) setAvailable(result.specialists);
-      },
-      () => {},
-    );
     return () => {
       stale = true;
     };
   }, [rpc, sagesRpc, sdk, initialProject]);
-  // The Envoy model setting seeds the pickers; a lead brings its own defaults instead.
-  const seed = envoyModel && !specialist ? envoyModel : null;
+  // The Envoy model setting seeds the pickers.
+  const seed = envoyModel ?? null;
   const submit = async (request: NewThreadRequest) => {
     if (pending) throw new Error("This task is already being created");
     setPending(true);
@@ -116,7 +107,6 @@ function NewEnvoyDialog({
         requestId: requestId.current,
         name,
         issueUrl,
-        specialist: specialist || null,
         request: JSON.parse(JSON.stringify(request)),
       });
       if (envoy.creation === "failed")
@@ -171,32 +161,6 @@ function NewEnvoyDialog({
             placeholder="https://tracker.example.com/issue/ABC-123"
           />
         </label>
-        <details>
-          <summary className="cursor-pointer text-sm text-muted-foreground">
-            Optional specialist lead
-          </summary>
-          <label className="mt-2 flex flex-col gap-1 text-sm">
-            Lead
-            <select
-              className={SELECT}
-              value={specialist}
-              disabled={pending}
-              onChange={(e) => setSpecialist(e.target.value)}
-            >
-              <option value="">Ordinary BB agent</option>
-              {available.map((s) => (
-                <option key={s.name} value={s.name}>
-                  {s.name} — {s.description}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="mt-2 text-xs text-muted-foreground">
-            Without a lead, the composer starts on the Envoy model from
-            settings. With one, the lead's saved defaults apply unless you pick
-            your own provider, model or reasoning level.
-          </p>
-        </details>
         <ErrorLine error={error} />
         {project && envoyModel !== undefined ? (
           <div className="min-h-64 shrink-0">
@@ -368,7 +332,6 @@ export function EnvoyList() {
               {envoy.chatId
                 ? `${envoy.lanes.length} ${envoy.lanes.length === 1 ? "lane" : "lanes"}`
                 : projects[envoy.projectId] ?? envoy.projectId}
-              {envoy.specialist ? ` · ${envoy.specialist}` : ""}
             </p>
             {envoy.chatId && envoy.lanes.length ? (
               <LaneList lanes={envoy.lanes} projects={projects} />
@@ -717,11 +680,6 @@ function EnvoyDetails({
                 className={`rounded-full px-2 py-0.5 font-medium capitalize ${LIFECYCLE_STYLE[envoy.lifecycle]}`}
               >
                 {envoy.lifecycle}
-              </span>
-              <span>
-                {envoy.chatId
-                  ? `Lanes led by ${envoy.specialist ?? "a BB agent"}`
-                  : `Led by ${envoy.specialist ?? "a BB agent"}`}
               </span>
               {envoy.issue ? (
                 <>
